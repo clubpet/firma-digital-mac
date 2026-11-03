@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import os
+import socketserver
 import sys
 import threading
 import traceback
@@ -665,6 +666,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(code, {"error": msg}, headers=hdrs)
 
 
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # Sin socket.getfqdn() de HTTPServer: el DNS inverso tarda ~35 s en Macs sin red/DNS lento (runners de CI).
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def main():
     global LIB, TRUST_DIR, LT, TSA
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -696,7 +704,7 @@ def main():
     n = len(trust_roots())
     level = "PAdES-B-LT" if LT and n else "PAdES-B-T" if TSA else "PAdES-B-B"
     log.info("Raices de confianza en %s: %d; firma %s; TSA %s", TRUST_DIR, n, level, TSA)
-    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    srv = Server((a.host, a.port), Handler)
     log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, srv.server_address[1], LIB)
     print(f"READY port={srv.server_address[1]}", flush=True)  # la app parsea esta linea
     if LT:
