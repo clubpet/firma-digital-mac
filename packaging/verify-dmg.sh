@@ -41,10 +41,14 @@ fi
 xcrun stapler validate -q "$APP" 2>/dev/null && ok "ticket de notarizacion stapleado" || note "sin ticket de notarizacion"
 
 echo "== Backend"
-BE="$APP/Contents/Resources/backend/firma-backend"
+RES="$APP/Contents/Resources"
+BE="$RES/backend/firma-backend"
+[ -d "$BE" ] && BE="$BE/firma-backend" # PyInstaller onedir
 if [ -x "$BE" ]; then
   LOG="$(mktemp)"
-  "$BE" --port 0 >"$LOG" 2>&1 & BPID=$!
+  # Mismos args que usa la app (Backend.swift); el dylib se pasa si esta.
+  LIB="$(find "$RES/driver" -name '*.dylib' 2>/dev/null | head -1)"
+  "$BE" --port 0 ${LIB:+--lib "$LIB"} --trust "$RES/trust" --token verify-dmg >"$LOG" 2>&1 & BPID=$!
   for _ in $(seq 1 60); do grep -q READY "$LOG" && break; kill -0 "$BPID" 2>/dev/null || break; sleep 0.5; done
   if grep -q READY "$LOG"; then ok "backend arranca: $(grep -m1 READY "$LOG")"; else bad "backend no imprimio READY"; sed 's/^/      /' "$LOG" | tail -20; fi
   kill "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null; BPID=
