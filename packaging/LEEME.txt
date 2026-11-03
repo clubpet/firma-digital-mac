@@ -1,0 +1,30 @@
+Firma Digital para macOS
+========================
+
+1. Arrastra "Firma Digital" a la carpeta Aplicaciones.
+2. Enchufa el token USB (mToken) antes de abrir la app.
+3. Abri "Firma Digital" desde Aplicaciones.
+
+Primera apertura
+----------------
+La app no esta notarizada por Apple, asi que macOS la bloquea la primera vez.
+Esto se hace una sola vez:
+
+macOS 14 (Sonoma):
+  Clic derecho (o Control + clic) sobre "Firma Digital" en Aplicaciones -> Abrir -> Abrir.
+
+macOS 15 (Sequoia) y macOS 26 (Tahoe):
+  El clic derecho -> Abrir ya no alcanza.
+  a) Abri la app con doble clic. Aparece el aviso "no se puede abrir". Toca "Listo".
+  b) Anda a Configuracion del Sistema -> Privacidad y seguridad.
+  c) Baja hasta "Seguridad": aparece "Se bloqueo Firma Digital". Toca "Abrir igual".
+  d) Confirma con tu contrasena o Touch ID y toca "Abrir igual" otra vez.
+
+Si nada de lo anterior funciona (cualquier version), en la app Terminal:
+  xattr -dr com.apple.quarantine "/Applications/Firma Digital.app"
+y despues abri la app normalmente.
+
+El driver del token
+-------------------
+Si la app no detecta el token, instala el driver oficial que viene dentro de la app
+(la app lo ofrece) y volve a enchufar el token.

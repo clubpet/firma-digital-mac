@@ -97,3 +97,10 @@ byte y comprueba que la firma queda invalida.
 - Solo probado con SoftHSM2 (RSA-2048/SHA-256). Con el driver real del mToken puede hacer falta
   `cert_label` si el token trae varios certificados.
 - Sin HTTPS ni autenticacion: pensado para escuchar solo en 127.0.0.1.
+
+## Distribucion
+
+`packaging/make-dmg.sh "app/build/Firma Digital.app"` arma `packaging/dist/Firma Digital-<version>.dmg`
+(app + link a Aplicaciones + LEEME.txt, firmado ad-hoc) e imprime el sha256; `packaging/verify-dmg.sh <dmg>`
+lo verifica. Sin certificado Developer ID la app no esta notarizada y el destinatario la habilita a mano la
+primera vez (pasos en `packaging/LEEME.txt`). Firma Developer ID + notarizacion: `packaging/README.md`.
