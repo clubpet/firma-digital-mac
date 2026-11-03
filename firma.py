@@ -26,6 +26,8 @@ from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers, validation
 from pyhanko.sign.pkcs11 import PKCS11Signer
+from pyhanko.pdf_utils import text
+from pyhanko.pdf_utils.font.basic import SimpleFontEngineFactory
 from pyhanko_certvalidator import ValidationContext
 from pyhanko_certvalidator.policy_decl import DisallowWeakAlgorithmsPolicy
 
@@ -132,7 +134,7 @@ def pick_cert(token, label):
 
 
 # ---------- firmar / verificar ----------
-def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, reason=None, location=None, cert_label=None):
+def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, w=220, h=60, reason=None, location=None, cert_label=None):
     if not lib_ok():
         raise RuntimeError(lib_error())
     with TOKEN_LOCK:
@@ -160,8 +162,9 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, reason=None, location=None, cer
             style = stamp.TextStampStyle(
                 stamp_text="Firmado digitalmente por\n%(signer)s\n%(ts)s", border_width=1,
                 timestamp_format="%d/%m/%Y %H:%M:%S %Z",
+                text_box_style=text.TextBoxStyle(font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9),
             )
-            spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + 220, y + 60))
+            spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + w, y + h))
             out = io.BytesIO()
             signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(w, output=out)
             return out.getvalue(), ("PAdES-B-LT" if vc else "PAdES-B-B"), cert_cn(signer.signing_cert)
@@ -229,7 +232,10 @@ button:disabled{opacity:.5} pre{background:#f7f7f5;padding:.7rem;border-radius:6
 <label>PDF</label><input type="file" name="pdf" accept="application/pdf" required>
 <label>PIN del token</label><input type="password" name="pin" autocomplete="off" required>
 <div class="row"><div><label>Página</label><input type="number" name="page" value="1" min="1"></div>
-<div><label>X (pt)</label><input type="number" name="x" value="50"></div><div><label>Y (pt)</label><input type="number" name="y" value="50"></div></div>
+<div><label>X (pt)</label><input type="number" name="x" value="50"></div><div><label>Y (pt)</label><input type="number" name="y" value="50"></div>
+<div><label>Ancho</label><input type="number" name="w" value="220"></div><div><label>Alto</label><input type="number" name="h" value="60"></div></div>
+<label>Posición de la firma: arrastrá un recuadro sobre la página</label>
+<div id="pv" style="position:relative;display:none;border:1px solid #bbb;border-radius:6px;overflow:hidden;cursor:crosshair;user-select:none"><canvas id="cv" style="display:block;width:100%"></canvas><div id="box" style="position:absolute;border:2px solid #0a7a2f;background:rgba(10,122,47,.12);display:none;pointer-events:none"></div></div>
 <label>Motivo (opcional)</label><input type="text" name="reason">
 <label>Lugar (opcional)</label><input type="text" name="location">
 <button>Firmar y descargar</button></form><pre id="fo"></pre></section>
@@ -258,6 +264,27 @@ $('#v').onsubmit=async e=>{e.preventDefault();$('#vo').textContent='Verificando�
  `<b>${f.campo}</b> — ${f.firmante} ${f.serial_number?'('+f.serial_number+')':''}\\nFecha: ${f.fecha_firma}\\n`+
  `<span class="${f.sin_modificar?'ok':'err'}">${f.sin_modificar?'Documento íntegro, sin modificar después de la firma':f.integra?'Firma íntegra pero el documento fue modificado después ('+f.modificaciones+')':'FIRMA INVÁLIDA: el documento fue alterado'}</span>\\n`+
  `<span class="${f.cadena_confiable?'ok':'err'}">Cadena confiable: ${f.cadena_confiable?'sí':'no'} — ${f.motivo_confianza}</span>\\nSello de tiempo: ${f.sello_de_tiempo?'sí':'no'}`).join('\\n\\n')};
+</script>
+<script type="module">
+// Vista previa con pdf.js: el recuadro arrastrado se traduce a puntos PDF (origen abajo-izquierda).
+import * as pdfjs from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs';
+pdfjs.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
+const f=document.getElementById('f'),pv=document.getElementById('pv'),cv=document.getElementById('cv'),box=document.getElementById('box');
+let doc=null,vp=null;
+async function render(){ if(!doc)return; const n=Math.min(Math.max(1,+f.page.value||1),doc.numPages); f.page.value=n; f.page.max=doc.numPages;
+ const pg=await doc.getPage(n); vp=pg.getViewport({scale:2}); cv.width=vp.width; cv.height=vp.height;
+ await pg.render({canvasContext:cv.getContext('2d'),viewport:vp}).promise; pv.style.display='block'; box.style.display='none'; }
+f.pdf.onchange=async()=>{ doc=await pdfjs.getDocument({data:await f.pdf.files[0].arrayBuffer()}).promise; f.page.value=1; render(); };
+f.page.onchange=render;
+let start=null; const pos=e=>{const r=cv.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top,r.width/vp.width]};
+pv.onpointerdown=e=>{start=pos(e);pv.setPointerCapture(e.pointerId);box.style.display='block'};
+pv.onpointermove=e=>{ if(!start)return; const [x,y]=pos(e); const l=Math.min(x,start[0]),t=Math.min(y,start[1]);
+ Object.assign(box.style,{left:l+'px',top:t+'px',width:Math.abs(x-start[0])+'px',height:Math.abs(y-start[1])+'px'}); };
+pv.onpointerup=e=>{ if(!start)return; const [x,y,k]=pos(e); const [sx,sy]=start; start=null; // k = px pantalla por unidad canvas
+ const s=k*2; // px pantalla por punto PDF (canvas a escala 2)
+ let w=Math.abs(x-sx)/s,h=Math.abs(y-sy)/s; if(w<20||h<10){box.style.display='none';return}
+ const left=Math.min(x,sx)/s, bottom=(cv.getBoundingClientRect().height-Math.max(y,sy))/s;
+ f.x.value=Math.round(left); f.y.value=Math.round(bottom); f.w.value=Math.round(w); f.h.value=Math.round(h); };
 </script></html>"""
 
 
@@ -318,6 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError("Falta el PIN.")
                 signed, level, cn = sign_pdf(
                     pdf, pin, page=int(form.get("page") or 1), x=int(form.get("x") or 50), y=int(form.get("y") or 50),
+                    w=int(form.get("w") or 220), h=int(form.get("h") or 60),
                     reason=form.get("reason"), location=form.get("location"), cert_label=form.get("cert_label") or None)
                 del pin, form
                 out = (os.path.splitext(fn or "documento")[0]) + "-firmado.pdf"
