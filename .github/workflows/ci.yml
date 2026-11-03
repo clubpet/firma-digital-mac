@@ -17,8 +17,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: brew install softhsm opensc
@@ -30,7 +30,7 @@ jobs:
         run: FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py
       # tar: upload-artifact pierde los permisos de ejecucion
       - run: tar -czf firma-backend.tgz dist/firma-backend
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: firma-backend
           path: firma-backend.tgz
@@ -41,12 +41,12 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: firma-backend
       - run: tar -xzf firma-backend.tgz
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: vendor
           key: driver-${{ hashFiles('app/fetch-driver.sh') }}
@@ -65,5 +65,5 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: shellcheck -S warning $(git ls-files '*.sh')
