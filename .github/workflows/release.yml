@@ -45,7 +45,9 @@ jobs:
           V: ${{ steps.v.outputs.version }}
         run: |
           cd packaging/dist
-          DMG="Firma Digital-$V.dmg"
+          # sin espacios: GitHub renombra los assets ("Firma.Digital-...") y el .sha256 dejaria de coincidir
+          DMG="Firma-Digital-$V.dmg"
+          mv "Firma Digital-$V.dmg" "$DMG"
           shasum -a 256 "$DMG" > "$DMG.sha256"
           SHA=$(cut -d' ' -f1 "$DMG.sha256")
           SECTION=$(awk -v v="$V" '/^## /{p = index($0, "## [" v "]") == 1; next} p' "$GITHUB_WORKSPACE/CHANGELOG.md")
@@ -74,7 +76,7 @@ jobs:
             packaging/dist/notes.md
       - name: Verify DMG
         env:
-          DMG: packaging/dist/Firma Digital-${{ steps.v.outputs.version }}.dmg
+          DMG: packaging/dist/Firma-Digital-${{ steps.v.outputs.version }}.dmg
         run: |
           # A veces queda un diskimages-helper de hdiutil create con el lock del DMG y verify/attach dan
           # "Resource temporarily unavailable" (runs 41736356015, 41737458230). Se verifica una copia identica.
@@ -90,4 +92,4 @@ jobs:
         run: |
           cd packaging/dist
           gh release create "v$V" --verify-tag --title "Firma Digital $V" --notes-file notes.md \
-            "Firma Digital-$V.dmg" "Firma Digital-$V.dmg.sha256"
+            "Firma-Digital-$V.dmg" "Firma-Digital-$V.dmg.sha256"
