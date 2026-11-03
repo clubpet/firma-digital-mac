@@ -6,9 +6,9 @@ REPO=$(dirname "$APP_DIR")
 BUILD=$(mkdir -p "${BUILD_DIR:-$APP_DIR/build}" && cd "${BUILD_DIR:-$APP_DIR/build}" && pwd)  # BUILD_DIR=app/build-dev: no pisar una app en uso
 APP="$BUILD/Firma Digital.app"
 RES="$APP/Contents/Resources"
-DRIVER_SRC="$HOME/Library/CryptoIDE/lib/liblm_cryptoide_pkcs11.dylib"
+DRIVER_SRC="$REPO/vendor/liblm_cryptoide_pkcs11.dylib"
 PKG_NAME=MSCryptoID-FIPS140-3_Mac_Spanish_V2.0.25.0912
-PKG_ZIP="$HOME/Desktop/mtoken-mac-driver/$PKG_NAME.zip"
+PKG_ZIP="$REPO/vendor/$PKG_NAME.zip"
 warn() { printf '\033[33mAVISO:\033[0m %s\n' "$*" >&2; }
 
 cd "$APP_DIR"
