@@ -190,7 +190,11 @@ final class SignPDFView: PDFView {
             let text = host.stampLines.joined(separator: "\n") as NSString
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: r).addClip()
-            text.draw(in: r.insetBy(dx: 4 * host.scaleFactor, dy: 3 * host.scaleFactor), withAttributes: attrs)
+            // Centrado como el sello real de pyHanko.
+            let inner = r.insetBy(dx: 4 * host.scaleFactor, dy: 3 * host.scaleFactor)
+            let ts = text.boundingRect(with: inner.size, options: [.usesLineFragmentOrigin], attributes: attrs).size
+            text.draw(in: CGRect(x: inner.midX - ts.width / 2, y: inner.midY - ts.height / 2, width: ts.width + 1, height: ts.height)
+                        .intersection(inner), withAttributes: attrs)
             NSGraphicsContext.restoreGraphicsState()
 
             guard host.editable else { return }

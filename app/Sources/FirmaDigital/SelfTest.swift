@@ -15,7 +15,15 @@ enum SelfTest {
             for _ in 0..<120 where state.cert == nil { try? await Task.sleep(for: .milliseconds(500)) }
             guard state.cert != nil else { print("sin token"); failures += 1; return }
             let src = URL(fileURLWithPath: pdf)
+            // PIN incorrecto: el texto del backend se muestra tal cual.
+            do {
+                _ = try await state.backend.sign(pdf: try Data(contentsOf: src), name: "t.pdf", pin: "0000", page: 1,
+                                                 rect: CGRect(x: 50, y: 50, width: 220, height: 60), reason: "", location: "", certID: nil)
+                print("PIN malo: firmo igual"); failures += 1
+            } catch let e as BackendError { print("PIN malo -> \"\(e.message)\" aviso=\(e.pinWarning ?? "-")") }
+            catch { print("PIN malo: \(error)"); failures += 1 }
             let n = PDFDocument(url: src)!.pageCount
+            if await !crashAndRestart(state) { print("reinicio del motor fallo"); failures += 1 }
             for i in 0..<n {
                 state.open(src)
                 try? await Task.sleep(for: .milliseconds(300))
@@ -38,6 +46,12 @@ enum SelfTest {
                 v.mouseUp(with: ev(.leftMouseUp, b))
                 guard let drawn = v.sigViewRect, state.sigPageIndex == i else { print("p\(i + 1): no se dibujo"); failures += 1; continue }
                 let sent = state.sigRect
+                if i == 0 { // captura de la UI con el recuadro dibujado
+                    state.pin = "1234"
+                    try? await Task.sleep(for: .milliseconds(400))
+                    _ = screenInk(v, page: page, out: URL(fileURLWithPath: out).appendingPathComponent("ui-firmar.png"))
+                    state.pin = ""
+                }
                 do {
                     let data = try Data(contentsOf: src)
                     let r = try await state.backend.sign(pdf: data, name: "t.pdf", pin: pin, page: i + 1, rect: sent,
@@ -67,6 +81,20 @@ enum SelfTest {
                         && abs(annot.width - sent.width) < 0.02 && abs(annot.height - sent.height) < 0.02
                     let ok = d < tol && annotOK
                     if !ok { failures += 1 }
+                    let ver = try await state.backend.verify(pdf: r.pdf, name: "t.pdf")
+                    let f = ver.firmas.first
+                    print("  verificar: firmas=\(ver.firmas.count) firmante=\(f?.firmante ?? "-") \(f?.serial_number ?? "") integra=\(f?.integra ?? false) sin_modificar=\(f?.sin_modificar ?? false)")
+                    if f?.integra != true || f?.sin_modificar != true { failures += 1 }
+                    if i == n - 1 { // capturas: modo Verificar y tarjeta de firmado con el ultimo PDF
+                        state.mode = .verificar
+                        for _ in 0..<60 where state.verification == nil { try? await Task.sleep(for: .milliseconds(250)) }
+                        try? await Task.sleep(for: .milliseconds(400))
+                        _ = screenInk(v, page: shown, out: URL(fileURLWithPath: out).appendingPathComponent("ui-verificar.png"))
+                        state.mode = .firmar
+                        state.signedURL = dest
+                        try? await Task.sleep(for: .milliseconds(400))
+                        _ = screenInk(v, page: shown, out: URL(fileURLWithPath: out).appendingPathComponent("ui-firmado.png"))
+                    }
                     print(String(format: "p%d rot=%d crop=%@ escala=%.2f enviado=(%.2f,%.2f,%.2f,%.2f) /Rect=(%.2f,%.2f,%.2f,%.2f) dibujado=%@ sello=%@ desvio=%.2fpt %@",
                                  i + 1, page.rotation, NSStringFromRect(page.bounds(for: .cropBox)), v.scaleFactor,
                                  sent.minX, sent.minY, sent.width, sent.height, annot.minX, annot.minY, annot.width, annot.height,
@@ -77,6 +105,19 @@ enum SelfTest {
                 }
             }
         }
+    }
+
+    /// Motor caido: matar el proceso, esperar el estado de error y reiniciarlo.
+    static func crashAndRestart(_ state: AppState) async -> Bool {
+        guard let pid = state.backend.pid else { return false }
+        kill(pid, SIGKILL)
+        for _ in 0..<20 { if case .failed = state.engine { break }; try? await Task.sleep(for: .milliseconds(250)) }
+        guard case .failed(let msg) = state.engine else { return false }
+        print("motor caido -> \"\(msg)\"")
+        state.startEngine()
+        for _ in 0..<120 where state.status == nil { try? await Task.sleep(for: .milliseconds(500)) }
+        print("reiniciado -> token \(state.cert?.cn ?? "ninguno")")
+        return state.cert != nil
     }
 
     static func fmt(_ r: CGRect) -> String { String(format: "[%.4f %.4f %.4f %.4f]", r.minX, r.minY, r.maxX, r.maxY) }

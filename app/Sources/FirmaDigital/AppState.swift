@@ -97,7 +97,7 @@ final class AppState: ObservableObject {
     }
 
     var stampLines: [String] {
-        let o = DateFormatter(); o.dateFormat = "dd/MM/yyyy HH:mm:ss zzz"
+        let o = DateFormatter(); o.dateFormat = "dd/MM/yyyy HH:mm:ss x" // como el sello real: "-03"
         return ["Firmado digitalmente por", cert?.cn ?? "NOMBRE DEL FIRMANTE", o.string(from: Date())]
     }
 

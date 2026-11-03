@@ -48,6 +48,7 @@ struct BackendError: LocalizedError {
 final class Backend: @unchecked Sendable {
     private var process: Process?
     private(set) var port: Int?
+    var pid: Int32? { process?.processIdentifier }
     private let secret = UUID().uuidString + UUID().uuidString
     private var stopping = false
     var onExit: ((String) -> Void)?
