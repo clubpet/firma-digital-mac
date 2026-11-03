@@ -38,13 +38,13 @@ FIRMA_PKCS11_LIB=/ruta/al/driver.dylib .venv/bin/python firma.py
 SOFTHSM2_CONF=$PWD/dev/softhsm2.conf FIRMA_PKCS11_LIB=/opt/homebrew/lib/softhsm/libsofthsm2.so .venv/bin/python firma.py
 ```
 
-Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--trust DIR`, `--port N` (0 = al azar), `--host`, `--token SECRETO`,
+Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--trust DIR`, `--port N` (0 = al azar), `--host`, `--token SECRETO`, `--lt`,
 `-v` (debug). La UI web no manda `X-Firma-Token`: con `--token` solo sirve la API.
 
 ## Uso
 
 - **Firmar:** PDF + PIN (+ pagina, posicion X/Y en puntos desde abajo-izquierda, motivo, lugar). Devuelve
-  `<nombre>-firmado.pdf` con una firma PAdES visible (recuadro de texto con el CN del firmante y fecha/hora).
+  `<nombre>-firmado.pdf` con una firma PAdES-B-B visible (recuadro de texto con el CN del firmante y fecha/hora).
   Cada firma agrega un campo `FirmaN`; un PDF ya firmado se puede volver a firmar (revision incremental).
   El PIN se usa solo en esa peticion: no se loguea ni se guarda. Con varios certificados en el token se
   toma el primero; se elige con `cert_id` (hex, el `id` de `/status`).
@@ -60,15 +60,17 @@ Modernizacion-PFDR, Encode, Lakaut, Box Custodia, Digilogix, AFIP, ANSES, etc.),
 oficial `https://pki.jgm.gov.ar/docs/Certificados_AC_Manual.zip`; origen y huellas SHA-256 en `trust/README.md`.
 Con `trust/` presente:
 
-- al firmar se embeben CRL/OCSP de la cadena → **PAdES-B-LT**. El `ValidationContext` se arma una vez y se
-  reusa entre firmas (cachea la CRL de ONTI, ~9 MB), se pre-carga en segundo plano al arrancar con los certs del
-  token y se rehace cuando una CRL cacheada pasa su `nextUpdate`. Sin red (o cadena no confiable) se firma igual
-  en **PAdES-B-B** y `X-Level` lo dice;
+- por defecto se firma **PAdES-B-B**: sin CRL/OCSP embebidas ni descargas al firmar. Con `--lt` (o
+  `FIRMA_LT=1`) se embeben CRL/OCSP de la cadena → **PAdES-B-LT**, pero la CRL de ONTI (`FD.crl`) pesa ~9 MB:
+  un PDF de 50 KB sale de ~9,3 MB (en B-B, 58 KB). En modo `--lt` el `ValidationContext` se arma una vez y se
+  reusa entre firmas, se pre-carga en segundo plano al arrancar con los certs del token y se rehace cuando una
+  CRL cacheada pasa su `nextUpdate`; los dos espejos de la CRL se bajan pero pyHanko embebe una sola copia
+  (dedup por contenido). Sin red (o cadena no confiable) se firma igual en **PAdES-B-B** y `X-Level` lo dice;
 - al verificar se valida la cadena contra esas raices, con la misma semantica que el validador oficial
   (https://validadordefirmas.gob.ar): cadena evaluada a la fecha de firma declarada, SHA-1 aceptado,
   revocacion soft-fail (el OCSP de ONTI responde `unauthorized`, la CRL diaria si anda).
 
-Sin `trust/` se firma **PAdES-B-B** (la UI lo avisa) y la verificacion reporta "sin raices de confianza".
+Sin `trust/` la verificacion reporta "sin raices de confianza".
 `FIRMA_TRUST_DIR` cambia la carpeta (lo usa el test).
 
 ## Validador oficial
@@ -89,9 +91,9 @@ existe en macOS.
 ```
 
 Recrea el token SoftHSM con 2 certs (01 autofirmado = raiz; 02 emitido por una CA de prueba con la CRL en un
-puerto cerrado), levanta el backend con `--port 0 --token`, prueba 401, PIN incorrecto, firma B-LT con
-`cert_id=01`, firma B-B con `cert_id=02` (simula sin red), pagina rotada y recortada, verifica, altera un byte y
-llama `/shutdown`. Contra el binario congelado: `FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py`.
+puerto cerrado), levanta el backend con `--port 0 --token`, prueba 401, PIN incorrecto, firma B-B (default) con
+`cert_id` 01 y 02, pagina rotada y recortada, verifica, altera un byte y llama `/shutdown`; despues lo levanta con
+`--lt`: B-LT con 01 y fallback a B-B con 02 (CRL caida, simula sin red). Contra el binario congelado: `FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py`.
 
 ## Limitaciones
 
@@ -118,13 +120,14 @@ carpeta `trust/` junto al ejecutable, si no la copia empaquetada en `_internal/t
 Contrato estable que usa la app nativa. Todas las respuestas de error de `/sign` son texto plano en castellano;
 las de los demas endpoints, JSON `{"error": "..."}`.
 
-**CLI:** `firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO]`. Al arrancar
-imprime por stdout exactamente una linea `READY port=<n>` (los logs van a stderr). `FIRMA_PKCS11_LIB` y
-`FIRMA_TRUST_DIR` siguen valiendo como default de `--lib`/`--trust`. Con `--token`, todo request sin el header
+**CLI:** `firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO] [--lt]`. Al
+arrancar imprime por stdout exactamente una linea `READY port=<n>` (los logs van a stderr). `FIRMA_PKCS11_LIB`,
+`FIRMA_TRUST_DIR` y `FIRMA_LT=1` valen como default de `--lib`/`--trust`/`--lt`. Sin `--lt` el backend queda
+ocioso al arrancar (no baja nada). Con `--token`, todo request sin el header
 `X-Firma-Token: <secreto>` recibe `401`.
 
 - `GET /health` → `{"ok": true, "version": "1.0.0"}`
-- `GET /status` → `{"lib", "lib_found", "trust_roots", "tokens": [{"slot", "label", "serial", "pin_status",
+- `GET /status` → `{"lib", "lib_found", "trust_roots", "lt", "tokens": [{"slot", "label", "serial", "pin_status",
   "certs": [{"label", "id", "cn", "subject", "valid_until"}]}]}` mas `"error"` si algo falla y `"pkcs11_error"`
   si la lib existe pero no carga o el token falla. `pin_status`: `ok` | `bajo` (CKF_USER_PIN_COUNT_LOW: hubo
   intentos fallidos desde el ultimo correcto) | `ultimo_intento` (CKF_USER_PIN_FINAL_TRY) | `bloqueado`.
@@ -137,9 +140,9 @@ imprime por stdout exactamente una linea `READY port=<n>` (los logs van a stderr
     espacio sin rotar (en una pagina a 90 grados, una caja que en pantalla es ancha tiene `w` chico y `h` grande,
     que es lo que devuelve PDFKit); el backend contrarrota la apariencia (`/Matrix`) para que el texto se lea
     derecho en pantalla.
-  - `200`: bytes del PDF; headers `X-Filename` y `X-Signer` (URL-encoded), `X-Level`: `PAdES-B-LT`, o
-    `PAdES-B-B (sin raices de confianza)`, o `PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)`
-    (comparar por prefijo).
+  - `200`: bytes del PDF; headers `X-Filename` y `X-Signer` (URL-encoded), `X-Level`: `PAdES-B-B` (default). Solo
+    con `--lt`: `PAdES-B-LT`, o `PAdES-B-B (sin raices de confianza)`, o `PAdES-B-B (sin CRL/OCSP: sin conexion o
+    cadena no confiable)` (comparar por prefijo).
   - Errores: `400` datos invalidos (falta PDF/PIN, pagina inexistente, caja fuera de la pagina, cert_id no hex);
     `401` falta `X-Firma-Token`; `403` PIN incorrecto o de largo invalido; `404` no hay cert con ese `cert_id`;
     `409` token no conectado, sin certificados, lib no encontrada o error del token; `423` PIN bloqueado. En `403`/

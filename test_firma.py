@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prueba punta a punta contra SoftHSM2: crea token (2 certs), levanta el backend, firma, verifica, altera un byte.
+"""Prueba punta a punta contra SoftHSM2: crea token (2 certs), levanta el backend (B-B y --lt), firma, verifica, altera.
 Uso: .venv/bin/python test_firma.py                         (firma.py)
      FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py   (binario congelado)
 """
@@ -92,21 +92,36 @@ def add_ca_cert(trust):
     shutil.rmtree(d)
 
 
-def main():
+def start(trust, *extra):
     global BASE
+    t0 = time.time()
+    srv = subprocess.Popen(BACKEND + ["--port", "0", "--token", SECRET, "--lib", LIB, "--trust", trust, *extra],
+                           stdout=subprocess.PIPE, text=True)
+    line = srv.stdout.readline().strip()
+    assert line.startswith("READY port="), line
+    BASE = f"http://127.0.0.1:{int(line.split('=')[1])}"
+    print(f"{line} {' '.join(extra)} en {time.time() - t0:.2f}s")
+    return srv
+
+
+def stop(srv):
+    assert req("/shutdown")[0] == 200
+    assert srv.wait(timeout=5) == 0
+
+
+def has_dss(pdf):
+    from pyhanko.pdf_utils.reader import PdfFileReader
+    return "/DSS" in PdfFileReader(io.BytesIO(pdf)).root
+
+
+def main():
     subprocess.run(["sh", os.path.join(HERE, "dev", "softhsm-setup.sh")], check=True, stdout=subprocess.DEVNULL)
     os.environ["SOFTHSM2_CONF"] = os.path.join(HERE, "dev", "softhsm2.conf")
     trust = tempfile.mkdtemp()
     shutil.copy(os.path.join(HERE, "dev", "test-cert.pem"), trust)  # cert autofirmado 01 = raiz
     add_ca_cert(trust)
-    t0 = time.time()
-    srv = subprocess.Popen(BACKEND + ["--port", "0", "--token", SECRET, "--lib", LIB, "--trust", trust],
-                           stdout=subprocess.PIPE, text=True)
+    srv = start(trust)
     try:
-        line = srv.stdout.readline().strip()
-        assert line.startswith("READY port="), line
-        BASE = f"http://127.0.0.1:{int(line.split('=')[1])}"
-        print(f"{line} en {time.time() - t0:.2f}s")
 
         assert req("/health", token=None)[0] == 401 and req("/health", token="otro")[0] == 401
         code, body, _ = req("/health")
@@ -114,7 +129,7 @@ def main():
 
         st = json.loads(req("/status")[1])
         print("status:", json.dumps(st, ensure_ascii=False))
-        assert st["lib_found"] and st["trust_roots"] == 2
+        assert st["lib_found"] and st["trust_roots"] == 2 and st["lt"] is False
         certs = {c["id"]: c["cn"] for c in st["tokens"][0]["certs"]}
         assert certs == {"01": "Juan Perez", "02": "Ana Gomez"}, certs
         assert st["tokens"][0]["pin_status"] == "ok"
@@ -132,7 +147,7 @@ def main():
             times.append(time.time() - t)
             assert code == 200, signed.decode()
         print("firmado:", h["X-Level"], h["X-Filename"], len(signed), "bytes; tiempos", [round(x, 3) for x in times])
-        assert h["X-Filename"] == "contrato-firmado.pdf" and h["X-Level"] == "PAdES-B-LT"
+        assert h["X-Filename"] == "contrato-firmado.pdf" and h["X-Level"] == "PAdES-B-B" and not has_dss(signed)
         assert widget(signed)[0] == [50.5, 60, 250.5, 110]
 
         code, body, _ = req("/verify", {"pdf": ("x.pdf", signed)})
@@ -143,11 +158,10 @@ def main():
         assert f["firmante"] == "Juan Perez" and f["serial_number"] == "CUIL 20123456785"
         assert f["integra"] and f["sin_modificar"] and f["cadena_confiable"], f
 
-        # cert 02 por cert_id, su CRL no responde: firma igual en B-B y lo dice
+        # segunda firma con cert 02 elegido por cert_id
         code, signed2, h = req("/sign", {"pdf": ("c.pdf", signed), "pin": "1234", "cert_id": "02", "x": "300", "y": "60"})
         assert code == 200, signed2.decode()
-        print("cert 02:", h["X-Level"], h["X-Signer"])
-        assert h["X-Level"].startswith("PAdES-B-B") and "sin CRL" in h["X-Level"] and h["X-Signer"] == "Ana%20Gomez"
+        assert h["X-Level"] == "PAdES-B-B" and h["X-Signer"] == "Ana%20Gomez", h
         v = json.loads(req("/verify", {"pdf": ("x.pdf", signed2)})[1])["firmas"]
         assert [x["firmante"] for x in v] == ["Juan Perez", "Ana Gomez"] and all(x["integra"] for x in v), v
         assert req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234", "cert_id": "ff"})[0] == 404
@@ -177,9 +191,18 @@ def main():
 
         assert json.loads(req("/verify", {"pdf": ("x.pdf", pdf)})[1])["firmas"] == []
 
-        assert req("/shutdown")[0] == 200
-        assert srv.wait(timeout=5) == 0
-        print("OK: firma + cert_id + B-B sin red + rotada/recortada + verificacion + alteracion + shutdown")
+        stop(srv)
+
+        # --lt: cert 01 (autofirmado = raiz, sin CRL que bajar) -> B-LT; cert 02 con CRL caida -> B-B y lo dice
+        srv = start(trust, "--lt")
+        assert json.loads(req("/status")[1])["lt"] is True
+        code, s, h = req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234", "cert_id": "01"})
+        assert code == 200 and h["X-Level"] == "PAdES-B-LT" and has_dss(s), h
+        code, s, h = req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234", "cert_id": "02"})
+        print("--lt cert 02:", h["X-Level"])
+        assert code == 200 and h["X-Level"].startswith("PAdES-B-B") and "sin CRL" in h["X-Level"], h
+        stop(srv)
+        print("OK: B-B default + cert_id + --lt (B-LT y B-B sin red) + rotada/recortada + verificacion + alteracion + shutdown")
     finally:
         if srv.poll() is None:
             srv.terminate()

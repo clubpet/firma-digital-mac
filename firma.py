@@ -2,7 +2,7 @@
 """Firma Digital (Ley 25.506) de PDFs con token PKCS#11 — app web local minima.
 
 Uso: python3 firma.py [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO]
-Raices de confianza opcionales: ./trust/*.pem (si existen, se valida cadena y se embebe CRL/OCSP = PAdES-B-LT).
+Firma PAdES-B-B; con --lt (o FIRMA_LT=1) y ./trust embebe CRL/OCSP = PAdES-B-LT (la CRL de ONTI suma ~9 MB al PDF).
 """
 import argparse
 import asyncio
@@ -43,6 +43,7 @@ if getattr(sys, "frozen", False):  # PyInstaller: ./trust junto al ejecutable, s
 else:
     DEFAULT_TRUST = os.path.join(HERE, "trust")
 TRUST_DIR = os.environ.get("FIRMA_TRUST_DIR", DEFAULT_TRUST)
+LT = os.environ.get("FIRMA_LT") == "1"  # B-LT opcional: embeber la CRL de ONTI suma ~9 MB a cada PDF
 # Driver oficial Longmai/Macroseguridad para mToken CryptoID FIPS 140-3 (VID 4C4D PID 8B15).
 # Orden: instalacion por usuario, instalacion del .pkg oficial, SoftHSM de desarrollo.
 CANDIDATE_LIBS = [
@@ -153,7 +154,7 @@ def token_certs(token):
 
 
 def status():
-    out = {"lib": LIB, "lib_found": lib_ok(), "trust_roots": len(trust_roots()), "tokens": []}
+    out = {"lib": LIB, "lib_found": lib_ok(), "trust_roots": len(trust_roots()), "lt": LT, "tokens": []}
     if not out["lib_found"]:
         out["error"] = lib_error()
         return out
@@ -267,7 +268,7 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
             token = first_token()
             cid, cert = pick_cert(token, cert_id)
             with VC_LOCK:
-                vc = signing_context()
+                vc = signing_context() if LT else None
                 lt = vc is not None and revinfo_ready(vc, cert)  # sin red o cadena no confiable: B-B
                 try:
                     session = token.open(user_pin=pin)
@@ -302,8 +303,8 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
     signed = out.getvalue()
     if lt and (cert.crl_distribution_points or cert.ocsp_urls) and not dss_has_revinfo(signed):
         lt = False
-    level = "PAdES-B-LT" if lt else ("PAdES-B-B (sin raices de confianza)" if vc is None else
-                                     "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)")
+    level = ("PAdES-B-LT" if lt else "PAdES-B-B" if not LT else "PAdES-B-B (sin raices de confianza)" if vc is None
+             else "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)")
     return signed, level, cert_cn(cert)
 
 
@@ -383,7 +384,7 @@ button:disabled{opacity:.5} pre{background:#f7f7f5;padding:.7rem;border-radius:6
 <script>
 const $=s=>document.querySelector(s);
 fetch('/status').then(r=>r.json()).then(s=>{
- let t=`Librería: ${s.lib} ${s.lib_found?'(encontrada)':'(NO ENCONTRADA)'} · Raíces de confianza: ${s.trust_roots} → ${s.trust_roots?'PAdES-B-LT':'PAdES-B-B (sin ./trust, no se valida cadena)'}`;
+ let t=`Librería: ${s.lib} ${s.lib_found?'(encontrada)':'(NO ENCONTRADA)'} · Raíces de confianza: ${s.trust_roots} → firma ${s.lt&&s.trust_roots?'PAdES-B-LT':'PAdES-B-B'}`;
  if(s.error) t+=`\\n<span class=err>${s.error}</span>`;
  else if(!s.tokens.length) t+='\\n<span class=err>No hay token conectado.</span>';
  else for(const k of s.tokens) t+=`\\nToken "${k.label}" · certs: `+(k.certs.map(c=>`${c.label} (${c.cn})`).join(', ')||'ninguno');
@@ -533,16 +534,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global LIB, TRUST_DIR
+    global LIB, TRUST_DIR, LT
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o autodeteccion)")
     ap.add_argument("--trust", default=TRUST_DIR, help="carpeta de raices de confianza (default: env FIRMA_TRUST_DIR o ./trust)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8780, help="0 = puerto libre al azar")
     ap.add_argument("--token", default=None, help="secreto exigido en el header X-Firma-Token")
+    ap.add_argument("--lt", action="store_true", default=LT, help="firmar PAdES-B-LT (embebe CRL/OCSP, ~9 MB con ONTI)")
     ap.add_argument("-v", action="store_true", help="log debug")
     a = ap.parse_args()
-    LIB, TRUST_DIR, Handler.secret = a.lib, a.trust, a.token
+    LIB, TRUST_DIR, LT, Handler.secret = a.lib, a.trust, a.lt, a.token
     logging.basicConfig(level=logging.DEBUG if a.v else logging.INFO, format="%(asctime)s %(message)s")  # stderr
     if not a.v:  # pyHanko loguea tracebacks completos por cada cadena no confiable
         for name in ("pyhanko", "pyhanko_certvalidator"):
@@ -550,11 +552,12 @@ def main():
     if not lib_ok():
         log.warning(lib_error())
     n = len(trust_roots())
-    log.info("Raices de confianza en %s: %d (%s)", TRUST_DIR, n, "PAdES-B-LT" if n else "PAdES-B-B")
+    log.info("Raices de confianza en %s: %d; firma %s", TRUST_DIR, n, "PAdES-B-LT" if LT and n else "PAdES-B-B")
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, srv.server_address[1], LIB)
     print(f"READY port={srv.server_address[1]}", flush=True)  # la app parsea esta linea
-    threading.Thread(target=prewarm, daemon=True).start()
+    if LT:
+        threading.Thread(target=prewarm, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
