@@ -118,6 +118,8 @@ flowchart LR
   firma el "Servicio de Sellado de Tiempo de JGM", emitido por AC ONTI). Si no hay conexión, firma igual sin
   sello (PAdES-B-B) y te avisa.
 
+Detalle (firma paso a paso, verificación, modelo de amenazas, rarezas): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Compilar desde el código
 
 Requisitos: Apple Silicon, macOS 14+, **Xcode 26+**, **Python 3.12**, y para los tests
@@ -127,8 +129,8 @@ Requisitos: Apple Silicon, macOS 14+, **Xcode 26+**, **Python 3.12**, y para los
 python3.12 -m venv .venv
 sh build-backend.sh                                 # instala requirements.txt y congela el motor -> dist/firma-backend/
 sh app/build-app.sh                                 # baja el driver, compila la app -> app/build/Firma Digital.app
-sh packaging/make-dmg.sh "app/build/Firma Digital.app"   # -> packaging/dist/Firma Digital-<versión>.dmg + sha256
-sh packaging/verify-dmg.sh "packaging/dist/Firma Digital-<versión>.dmg"
+bash packaging/make-dmg.sh "app/build/Firma Digital.app" # -> packaging/dist/Firma Digital-<versión>.dmg + sha256
+bash packaging/verify-dmg.sh "packaging/dist/Firma Digital-<versión>.dmg"
 ```
 
 `BUILD_DIR=app/build-dev sh app/build-app.sh` compila en otra carpeta (para no pisar una app abierta). Firma
@@ -166,7 +168,7 @@ JSON `{"error": "..."}`.
 **CLI**
 
 ```
-firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO] [--lt] [--tsa URL|none] [-v]
+firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO] [--parent-pid PID] [--lt] [--tsa URL|none] [-v]
 ```
 
 - Al arrancar imprime por stdout una sola línea `READY port=<n>` (los logs van a stderr). `--port 0` = puerto
@@ -174,7 +176,12 @@ firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token 
 - `FIRMA_PKCS11_LIB`, `FIRMA_TRUST_DIR`, `FIRMA_LT=1` y `FIRMA_TSA` son los defaults de `--lib`, `--trust`,
   `--lt` y `--tsa`. TSA por defecto: `https://tsa.encodesa.com.ar/tsa`.
 - Sin `--lib` busca el driver en `~/Library/CryptoIDE/lib/`, `/opt/CryptoIDE/lib/` y SoftHSM de Homebrew.
-- Con `--token`, todo request sin el header `X-Firma-Token: <secreto>` recibe `401`.
+- Con `--token` (default: env `FIRMA_TOKEN`), todo request sin el header `X-Firma-Token: <secreto>` recibe
+  `401`. La app pasa el secreto por `FIRMA_TOKEN`, no por argv, para que no aparezca en `ps`.
+- Sin `--token` (modo web), los requests cuyo `Host`/`Origin` no es localhost reciben `401` (protección contra
+  CSRF y DNS rebinding desde páginas web).
+- `--parent-pid PID`: el motor termina cuando muere ese proceso (la app pasa su propio pid, así no quedan
+  motores huérfanos).
 - Sin `--lt` el motor queda ocioso al arrancar (no descarga nada).
 
 **Endpoints**
