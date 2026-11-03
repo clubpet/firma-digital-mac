@@ -12,6 +12,7 @@ enum SelfTest {
         Task {
             var failures = 0
             defer { print("SELFTEST \(failures == 0 ? "OK" : "FALLO (\(failures))")"); NSApp.terminate(nil) }
+            failures += await replaceTest(state, URL(fileURLWithPath: pdf), out: URL(fileURLWithPath: out))
             for _ in 0..<120 where state.cert == nil { try? await Task.sleep(for: .milliseconds(500)) }
             guard state.cert != nil else { print("sin token"); failures += 1; return }
             let src = URL(fileURLWithPath: pdf)
@@ -107,6 +108,70 @@ enum SelfTest {
         }
     }
 
+    /// Abrir A y despues B (bug "una vez que agrego un pdf no lo puedo reemplazar") por cada camino de apertura.
+    static func replaceTest(_ state: AppState, _ a: URL, out: URL) async -> Int {
+        var fails = 0
+        let b = out.appendingPathComponent("b.pdf")
+        let bd = PDFDocument(url: a)!; bd.removePage(at: bd.pageCount - 1); bd.write(to: b)
+        let nA = PDFDocument(url: a)!.pageCount, nB = nA - 1
+        func check(_ path: String, _ url: URL, _ n: Int) async {
+            try? await Task.sleep(for: .milliseconds(400))
+            let v = state.pdfView
+            let wins = NSApp.windows.filter { $0.isVisible && !($0 is NSPanel) }.count
+            let ok = wins == 1 && state.docURL == url && state.document?.pageCount == n && v?.document === state.document
+                && state.sigPageIndex == nil && state.sigRect == .zero && v?.sigViewRect == nil
+            if !ok { fails += 1 }
+            print("abrir[\(path)] \(url.lastPathComponent): docURL=\(state.docURL?.lastPathComponent ?? "-") paginas=\(state.document?.pageCount ?? -1) "
+                  + "vista=\(v?.document?.pageCount ?? -1) mismaInstancia=\(v?.document === state.document) ventanas=\(wins) recuadro=\(state.sigRect) \(ok ? "OK" : "FALLO")")
+        }
+        func drawRect() async {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let v = state.pdfView, let p = v.currentPage else { return }
+            let r = v.convert(p.bounds(for: .cropBox), from: p)
+            let e = NSEvent.mouseEvent(with: .leftMouseDown, location: v.convert(CGPoint(x: r.midX, y: r.midY), to: nil), modifierFlags: [],
+                                       timestamp: 0, windowNumber: v.window!.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            v.mouseDown(with: e); v.mouseUp(with: e)
+        }
+        // 1) state.open directo
+        state.open(a); await check("state.open", a, nA); await drawRect()
+        state.open(b); await check("state.open", b, nB)
+        // 2) Finder "Abrir con" / Dock: application(_:open:)
+        await drawRect()
+        AppDelegate.shared?.application(NSApp, open: [a]); await check("application(open:)", a, nA)
+        // 3) Boton Abrir PDF / Cmd+O: el panel tiene que salir como hoja de la ventana principal, sin ventanas nuevas.
+        //    (Elegir un archivo dentro del panel no se automatiza: el panel es de otro proceso; al aceptar llama a state.open.)
+        state.openPanel()
+        try? await Task.sleep(for: .milliseconds(1500))
+        let main = state.pdfView?.window
+        let sheet = main?.attachedSheet
+        print("abrir[panel]: hoja=\(sheet.map { "\(type(of: $0))" } ?? "ninguna") ventanas=\(NSApp.windows.filter { $0.isVisible && !($0 is NSPanel) }.count)")
+        if !(sheet is NSOpenPanel) { fails += 1 }
+        if let sheet { main?.endSheet(sheet, returnCode: .cancel) }
+        await check("panel cancelado", a, nA)
+        // 4) Arrastrar desde Finder sobre el PDFView: misma secuencia que AppKit (entered, prepare, perform).
+        await drawRect()
+        if let v = state.pdfView {
+            let pb = NSPasteboard(name: NSPasteboard.Name("firma-selftest"))
+            pb.clearContents(); pb.writeObjects([b as NSURL])
+            let d = FakeDrag(pb, window: v.window!)
+            let op = v.draggingEntered(d), prep = v.prepareForDragOperation(d)
+            let perf = prep && v.performDragOperation(d)
+            print("arrastre: entered=\(op.rawValue) prepare=\(prep) perform=\(perf)")
+            await check("arrastre", b, nB)
+        }
+        // 5) Destinos de arrastre: quien recibe un drop sobre el PDF
+        if let v = state.pdfView {
+            func walk(_ x: NSView, _ d: Int) {
+                if !x.registeredDraggedTypes.isEmpty || x === v {
+                    print(String(repeating: "  ", count: d) + "drag \(type(of: x)) tipos=\(x.registeredDraggedTypes.map(\.rawValue))")
+                }
+                x.subviews.forEach { walk($0, d + 1) }
+            }
+            walk(v.window!.contentView!, 0)
+        }
+        return fails
+    }
+
     /// Motor caido: matar el proceso, esperar el estado de error y reiniciarlo.
     static func crashAndRestart(_ state: AppState) async -> Bool {
         guard let pid = state.backend.pid else { return false }
@@ -150,4 +215,26 @@ enum SelfTest {
         return CGRect(x: (CGFloat(x0) - px.minX) / px.width, y: (CGFloat(y0) - px.minY) / px.height,
                       width: CGFloat(x1 + 1 - x0) / px.width, height: CGFloat(y1 + 1 - y0) / px.height)
     }
+}
+
+/// NSDraggingInfo minimo para simular el lado destino de un drop.
+final class FakeDrag: NSObject, NSDraggingInfo {
+    let draggingPasteboard: NSPasteboard
+    let draggingDestinationWindow: NSWindow?
+    init(_ pb: NSPasteboard, window: NSWindow) { draggingPasteboard = pb; draggingDestinationWindow = window }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggingLocation: NSPoint { .zero }
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    func enumerateDraggingItems(options: NSDraggingItemEnumerationOptions = [], for view: NSView?, classes: [AnyClass],
+                                searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:],
+                                using block: @escaping (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func resetSpringLoading() {}
 }

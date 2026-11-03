@@ -22,10 +22,6 @@ struct ContentView: View {
             }
         }
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Button { state.openPanel() } label: { Label("Abrir PDF", systemImage: "doc.badge.plus") }
-                    .help("Abrir un PDF (Cmd+O)")
-            }
             ToolbarItem(placement: .principal) {
                 Picker("Modo", selection: $state.mode) {
                     ForEach(Mode.allCases, id: \.self) { Text($0.rawValue) }
@@ -33,6 +29,10 @@ struct ContentView: View {
                 .pickerStyle(.segmented).frame(width: 220)
             }
             ToolbarItemGroup(placement: .primaryAction) {
+                // Siempre visible y con texto: con un PDF abierto, abrir otro lo reemplaza.
+                Button { state.openPanel() } label: { Label("Abrir PDF", systemImage: "doc.badge.plus").labelStyle(.titleAndIcon) }
+                    .buttonStyle(.borderedProminent)
+                    .help("Abrir otro PDF (Cmd+O). Reemplaza el actual.")
                 if let d = state.document, d.pageCount > 0 {
                     Button { state.goTo(page: state.currentPage - 1) } label: { Label("Anterior", systemImage: "chevron.up") }
                         .disabled(state.currentPage == 0)

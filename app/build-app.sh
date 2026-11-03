@@ -3,7 +3,7 @@
 set -eu
 APP_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO=$(dirname "$APP_DIR")
-BUILD="$APP_DIR/build"
+BUILD=$(mkdir -p "${BUILD_DIR:-$APP_DIR/build}" && cd "${BUILD_DIR:-$APP_DIR/build}" && pwd)  # BUILD_DIR=app/build-dev: no pisar una app en uso
 APP="$BUILD/Firma Digital.app"
 RES="$APP/Contents/Resources"
 DRIVER_SRC="$HOME/Library/CryptoIDE/lib/liblm_cryptoide_pkcs11.dylib"

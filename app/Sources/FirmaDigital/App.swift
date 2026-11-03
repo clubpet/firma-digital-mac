@@ -4,6 +4,8 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState?
     var pendingOpen: URL?
+    static weak var shared: AppDelegate?
+    override init() { super.init(); Self.shared = self }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ notification: Notification) { MainActor.assumeIsolated { state?.shutdown() } }
     func application(_ application: NSApplication, open urls: [URL]) {

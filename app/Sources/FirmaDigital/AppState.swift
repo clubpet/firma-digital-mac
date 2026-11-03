@@ -107,7 +107,16 @@ final class AppState: ObservableObject {
         let p = NSOpenPanel()
         p.allowedContentTypes = [.pdf]
         p.allowsMultipleSelection = false
-        if p.runModal() == .OK, let u = p.url { open(u) }
+        present(p) { [weak self] r in if r == .OK, let u = p.url { self?.open(u) } }
+    }
+
+    /// Hoja pegada a la ventana principal (runModal abria el panel como ventana aparte y la principal parpadeaba).
+    private func present(_ p: NSSavePanel, done: @escaping (NSApplication.ModalResponse) -> Void) {
+        if let w = pdfView?.window ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
+            p.beginSheetModal(for: w, completionHandler: done)
+        } else {
+            p.begin(completionHandler: done)
+        }
     }
 
     func open(_ url: URL) {
@@ -148,7 +157,7 @@ final class AppState: ObservableObject {
                 let r = try await backend.sign(pdf: data, name: url.lastPathComponent, pin: pinNow, page: page + 1, rect: sigRect,
                                                reason: reason, location: location, certID: cert?.id)
                 pinWarning = nil
-                guard let dest = savePanel(suggested: r.filename ?? url.deletingPathExtension().lastPathComponent + "-firmado.pdf", near: url) else {
+                guard let dest = await savePanel(suggested: r.filename ?? url.deletingPathExtension().lastPathComponent + "-firmado.pdf", near: url) else {
                     signError = "Firmado, pero no se guardó: cancelaste el guardado. Volvé a firmar para obtener el archivo."
                     return
                 }
@@ -170,13 +179,13 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func savePanel(suggested: String, near: URL) -> URL? {
+    private func savePanel(suggested: String, near: URL) async -> URL? {
         let p = NSSavePanel()
         p.allowedContentTypes = [.pdf]
         p.nameFieldStringValue = suggested
         p.directoryURL = UserDefaults.standard.url(forKey: "lastSaveDir") ?? near.deletingLastPathComponent()
-        guard p.runModal() == .OK, let u = p.url else { return nil }
-        UserDefaults.standard.set(u.deletingLastPathComponent(), forKey: "lastSaveDir")
+        let u: URL? = await withCheckedContinuation { c in present(p) { r in c.resume(returning: r == .OK ? p.url : nil) } }
+        if let u { UserDefaults.standard.set(u.deletingLastPathComponent(), forKey: "lastSaveDir") }
         return u
     }
 
