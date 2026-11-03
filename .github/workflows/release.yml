@@ -73,7 +73,15 @@ jobs:
             packaging/dist/*.sha256
             packaging/dist/notes.md
       - name: Verify DMG
-        run: bash packaging/verify-dmg.sh "packaging/dist/Firma Digital-${{ steps.v.outputs.version }}.dmg"
+        env:
+          DMG: packaging/dist/Firma Digital-${{ steps.v.outputs.version }}.dmg
+        run: |
+          # A veces queda un diskimages-helper de hdiutil create con el lock del DMG y verify/attach dan
+          # "Resource temporarily unavailable" (runs 41736356015, 41737458230). Se verifica una copia identica.
+          sudo lsof "$DMG" || true
+          cp "$DMG" "$RUNNER_TEMP/verify.dmg"
+          cmp "$DMG" "$RUNNER_TEMP/verify.dmg"
+          bash packaging/verify-dmg.sh "$RUNNER_TEMP/verify.dmg"
       - name: GitHub release
         if: github.ref_type == 'tag' && !inputs.dry_run
         env:
