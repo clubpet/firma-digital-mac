@@ -397,8 +397,28 @@ def main():
         srv = start(trust, "--tsa", "none", token_env=True)
         assert req("/health", token=None)[0] == 401 and req("/health")[0] == 200
         stop(srv)
+        # modo web (sin secreto): la propia pagina si; otro sitio (CSRF) o DNS rebinding no
+        srv = subprocess.Popen(
+            BACKEND + ["--port", "0", "--lib", LIB, "--trust", trust, "--tsa", "none"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        port = int(srv.stdout.readline().split("=")[1])
+
+        def web(path, **h):
+            r = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=h)
+            try:
+                return urllib.request.urlopen(r).status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        assert web("/") == 200 and web("/status", Origin=f"http://127.0.0.1:{port}") == 200
+        assert (
+            web("/status", Origin="https://otro.example") == 401 and web("/status", Host=f"otro.example:{port}") == 401
+        )
+        assert web("/shutdown") == 200 and srv.wait(timeout=5) == 0
         print(
-            "OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown + --parent-pid + FIRMA_TOKEN"
+            "OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown + --parent-pid + FIRMA_TOKEN + modo web"
         )
     finally:
         if srv.poll() is None:

@@ -579,10 +579,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self):
-        if self.secret is None or hmac.compare_digest(
-            self.headers.get("X-Firma-Token", "").encode(), self.secret.encode()
-        ):
+        if self.secret is not None:
+            if hmac.compare_digest(self.headers.get("X-Firma-Token", "").encode(), self.secret.encode()):
+                return True
+        elif self._same_origin():
             return True
+        self._send(401, "No autorizado.", "text/plain; charset=utf-8")
+        return False
+
+    def _same_origin(self):
+        """Modo web (sin --token): solo pedidos de la propia pagina. Sin esto cualquier sitio abierto en el navegador
+        puede mandar un form a /sign con PINs al azar y bloquear el token (CSRF), o leer /status via DNS rebinding."""
+        port = self.server.server_address[1]
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"{self.server.server_address[0]}:{port}"}
+        origin = self.headers.get("Origin")
+        return self.headers.get("Host") in hosts and (origin is None or origin.removeprefix("http://") in hosts)
         self._send(401, "No autorizado.", "text/plain; charset=utf-8")
         return False
 
