@@ -5,6 +5,7 @@ APP_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO=$(dirname "$APP_DIR")
 BUILD=$(mkdir -p "${BUILD_DIR:-$APP_DIR/build}" && cd "${BUILD_DIR:-$APP_DIR/build}" && pwd)  # BUILD_DIR=app/build-dev: no pisar una app en uso
 APP="$BUILD/Firma Digital.app"
+VERSION=$(cat "$REPO/VERSION")
 RES="$APP/Contents/Resources"
 DRIVER_SRC="$REPO/vendor/liblm_cryptoide_pkcs11.dylib"
 PKG_NAME=MSCryptoID-FIPS140-3_Mac_Spanish_V2.0.25.0912
@@ -30,8 +31,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Firma Digital</string>
   <key>CFBundleExecutable</key><string>FirmaDigital</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleDevelopmentRegion</key><string>es</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

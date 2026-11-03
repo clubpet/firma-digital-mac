@@ -36,8 +36,12 @@ from pyhanko.sign.timestamps import HTTPTimeStamper
 from pyhanko_certvalidator import CertificateValidator, ValidationContext
 from pyhanko_certvalidator.policy_decl import DisallowWeakAlgorithmsPolicy
 
-VERSION = "1.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
+try:  # VERSION en la raiz del repo; PyInstaller lo empaqueta en _MEIPASS (backend.spec)
+    with open(os.path.join(getattr(sys, "_MEIPASS", HERE), "VERSION")) as _f:
+        VERSION = _f.read().strip()
+except OSError:
+    VERSION = "dev"
 if getattr(sys, "frozen", False):  # PyInstaller: ./trust junto al ejecutable, si no el empaquetado
     _side = os.path.join(os.path.dirname(sys.executable), "trust")
     DEFAULT_TRUST = _side if os.path.isdir(_side) else os.path.join(sys._MEIPASS, "trust")
