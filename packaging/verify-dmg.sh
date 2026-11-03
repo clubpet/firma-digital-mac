@@ -21,8 +21,18 @@ trap cleanup EXIT
 
 echo "== DMG"
 codesign --verify "$DMG" && ok "firma del dmg" || bad "firma del dmg"
-hdiutil verify -quiet "$DMG" && ok "checksum del dmg" || bad "checksum del dmg"
-hdiutil attach -readonly -nobrowse -noautoopen -quiet -mountpoint "$MNT" "$DMG" || { bad "no monta"; exit 1; }
+# hdiutil recien creado puede estar tomado (diskimages-helper, en los runners de CI): reintentar y mostrar el error.
+hd() {
+  local out i
+  for i in 1 2 3 4 5; do
+    out="$(hdiutil "$@" 2>&1)" && return 0
+    echo "      hdiutil $1 (intento $i): $out" >&2
+    sleep 3
+  done
+  return 1
+}
+hd verify "$DMG" && ok "checksum del dmg" || bad "checksum del dmg"
+hd attach -readonly -nobrowse -noautoopen -mountpoint "$MNT" "$DMG" || { bad "no monta"; exit 1; }
 ls -la "$MNT"
 
 APP="$(find "$MNT" -maxdepth 1 -name '*.app' | head -1)"

@@ -40,8 +40,6 @@ jobs:
         run: sh app/build-app.sh
       - name: DMG
         run: bash packaging/make-dmg.sh "app/build/Firma Digital.app"
-      - name: Verify DMG
-        run: bash packaging/verify-dmg.sh "packaging/dist/Firma Digital-${{ steps.v.outputs.version }}.dmg"
       - name: sha256 + notas
         env:
           V: ${{ steps.v.outputs.version }}
@@ -66,6 +64,7 @@ jobs:
             echo "(o Ajustes del Sistema → Privacidad y seguridad → **Abrir igualmente**). Detalle en \`LEEME.txt\` dentro del DMG."
           } > notes.md
           cat notes.md
+      # antes de verificar: si verify falla, el DMG queda para inspeccionarlo
       - uses: actions/upload-artifact@v4
         with:
           name: dmg-${{ steps.v.outputs.version }}
@@ -73,6 +72,8 @@ jobs:
             packaging/dist/*.dmg
             packaging/dist/*.sha256
             packaging/dist/notes.md
+      - name: Verify DMG
+        run: bash packaging/verify-dmg.sh "packaging/dist/Firma Digital-${{ steps.v.outputs.version }}.dmg"
       - name: GitHub release
         if: github.ref_type == 'tag' && !inputs.dry_run
         env:
