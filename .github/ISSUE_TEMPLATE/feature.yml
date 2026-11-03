@@ -1,0 +1,24 @@
+name: Proponer una mejora
+description: Una idea o algo que te falta
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problema
+    attributes:
+      label: Qué necesitás resolver
+      description: Contá el caso de uso. Ej. "firmo 20 PDFs por día y quiero firmarlos todos de una".
+    validations:
+      required: true
+  - type: textarea
+    id: propuesta
+    attributes:
+      label: Cómo te lo imaginás
+  - type: input
+    id: token
+    attributes:
+      label: Modelo de token (si aplica)
+      placeholder: "mToken CryptoID FIPS 140-3"
+  - type: input
+    id: macos
+    attributes:
+      label: Versión de macOS (si aplica)

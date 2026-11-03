@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Problema de seguridad
+    url: https://github.com/clubpet/firma-digital-mac/security/advisories/new
+    about: Reportalo en privado, no en un issue público.
+  - name: Validador oficial de firmas
+    url: https://validadordefirmas.gob.ar
+    about: El veredicto que vale ante terceros. Probá ahí antes de reportar un problema de firma.
