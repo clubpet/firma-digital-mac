@@ -12,9 +12,17 @@ python3 -m venv .venv
 .venv/bin/pip install 'pyHanko[pkcs11]'
 ```
 
-**Produccion (token real):** instalar el driver PKCS#11 del fabricante (para mToken CryptoID historicamente
-`libcastle_v2.1.0.0.dylib`) y apuntar a el con `FIRMA_PKCS11_LIB` o `--lib`. Si la ruta no existe, la UI y
-`/status` lo dicen claramente.
+**Produccion (token mToken CryptoID FIPS 140-3):** el driver macOS oficial es el .pkg de Macroseguridad
+`MSCryptoID-FIPS140-3_Mac_Spanish_V2.0.25.0912` (Longmai, Developer ID 4M7RX53G2N, notarizado). Macroseguridad
+solo lo entrega por ticket en https://soporte.macroseguridad.la, pero el Colegio de Escribanos PBA lo hostea:
+https://www.colescba.org.ar/static/descarga/fima-digital/2026/MSCryptoID-FIPS140-3_Mac_Spanish_V2.0.25.0912%201.zip
+(sha256 zip `0ebb810531a6716be9fe3957f803c836e5e91b1e77a944f6c04c3d22f41686da`). El .pkg instala
+`/opt/CryptoIDE/lib/liblm_cryptoide_pkcs11.dylib` (universal x86_64+arm64, PKCS#11 sobre PC/SC; el token es
+CCID, macOS no necesita driver USB) mas una app Qt x86_64 que pide Rosetta. Alternativa sin Rosetta ni sudo:
+copiar solo la dylib a `~/Library/CryptoIDE/lib/`. `firma.py` busca ambas rutas solo; si no, `FIRMA_PKCS11_LIB`
+o `--lib`. Si la ruta no existe, la UI y `/status` lo dicen claramente.
+Chequeo rapido: `pkcs11-tool --module ~/Library/CryptoIDE/lib/liblm_cryptoide_pkcs11.dylib -L` (brew opensc).
+PIN de usuario de fabrica: `12345678` (salvo que la Autoridad de Registro lo haya cambiado). 3 PIN malos bloquean.
 
 **Desarrollo (sin token):** `brew install softhsm opensc` y `sh dev/softhsm-setup.sh` crea un token
 SoftHSM2 `FirmaDev` (PIN `1234`) con clave RSA + cert autofirmado "Juan Perez, CUIL 20123456785".

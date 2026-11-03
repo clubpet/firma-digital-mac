@@ -30,7 +30,14 @@ from pyhanko_certvalidator import ValidationContext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRUST_DIR = os.environ.get("FIRMA_TRUST_DIR", os.path.join(HERE, "trust"))
-DEFAULT_LIB = "/opt/homebrew/lib/softhsm/libsofthsm2.so"
+# Driver oficial Longmai/Macroseguridad para mToken CryptoID FIPS 140-3 (VID 4C4D PID 8B15).
+# Orden: instalacion por usuario, instalacion del .pkg oficial, SoftHSM de desarrollo.
+CANDIDATE_LIBS = [
+    os.path.expanduser("~/Library/CryptoIDE/lib/liblm_cryptoide_pkcs11.dylib"),
+    "/opt/CryptoIDE/lib/liblm_cryptoide_pkcs11.dylib",
+    "/opt/homebrew/lib/softhsm/libsofthsm2.so",
+]
+DEFAULT_LIB = next((p for p in CANDIDATE_LIBS if os.path.exists(p)), CANDIDATE_LIBS[0])
 LIB = os.environ.get("FIRMA_PKCS11_LIB", DEFAULT_LIB)
 # ponytail: lock global sobre el token; los tokens USB no toleran sesiones concurrentes.
 TOKEN_LOCK = threading.Lock()
