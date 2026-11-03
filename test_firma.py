@@ -230,13 +230,16 @@ def mock_tsa(tsa_dir):
     return f"http://127.0.0.1:{srv.server_address[1]}/tsa"
 
 
-def start(trust, *extra):
+def start(trust, *extra, token_env=False):
+    """token_env: secreto por FIRMA_TOKEN en vez de --token (asi lo pasa la app)."""
     global BASE
     t0 = time.time()
+    tok, env = ([], {**os.environ, "FIRMA_TOKEN": SECRET}) if token_env else (["--token", SECRET], None)
     srv = subprocess.Popen(
-        BACKEND + ["--port", "0", "--token", SECRET, "--lib", LIB, "--trust", trust, *extra],
+        BACKEND + ["--port", "0", *tok, "--lib", LIB, "--trust", trust, *extra],
         stdout=subprocess.PIPE,
         text=True,
+        env=env,
     )
     line = srv.stdout.readline().strip()
     assert line.startswith("READY port="), line
@@ -388,8 +391,14 @@ def main():
         else:
             print("TSA real no disponible, salteado:", h.get("X-Level"))
         stop(srv)
+        # --parent-pid que no es el padre: se cierra solo (lo que pasa si la app muere sin /shutdown)
+        srv = start(trust, "--parent-pid", "1")
+        assert srv.wait(timeout=5) == 0
+        srv = start(trust, "--tsa", "none", token_env=True)
+        assert req("/health", token=None)[0] == 401 and req("/health")[0] == 200
+        stop(srv)
         print(
-            "OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown"
+            "OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown + --parent-pid + FIRMA_TOKEN"
         )
     finally:
         if srv.poll() is None:

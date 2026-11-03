@@ -216,8 +216,8 @@ struct PDFCanvas: NSViewRepresentable {
         v.displayMode = .singlePageContinuous
         v.displaysPageBreaks = true
         v.backgroundColor = .underPageBackgroundColor
-        v.onSigChange = { page, rect in
-            state.sigPageIndex = page.flatMap { v.document?.index(for: $0) }
+        v.onSigChange = { [weak v] page, rect in // weak: el closure vive en v
+            state.sigPageIndex = page.flatMap { v?.document?.index(for: $0) }
             state.sigRect = rect
         }
         v.onDropURL = { state.open($0) }

@@ -1,16 +1,17 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState?
     var pendingOpen: URL?
     static weak var shared: AppDelegate?
     override init() { super.init(); Self.shared = self }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ notification: Notification) { MainActor.assumeIsolated { state?.shutdown() } }
+    func applicationWillTerminate(_ notification: Notification) { state?.shutdown() }
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let u = urls.first else { return }
-        MainActor.assumeIsolated { if let state { state.open(u) } else { pendingOpen = u } }
+        if let state { state.open(u) } else { pendingOpen = u }
     }
 }
 

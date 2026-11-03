@@ -22,6 +22,7 @@ import os
 import socketserver
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 from datetime import datetime, timezone
@@ -666,6 +667,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(code, {"error": msg}, headers=hdrs)
 
 
+def watch_parent(pid, srv):
+    """Si la app muere sin llamar /shutdown (crash, kill -9) el motor quedaria huerfano con el token: cortar."""
+    while os.getppid() == pid:
+        time.sleep(1)
+    log.warning("El proceso padre %d ya no esta: cierro el motor", pid)
+    srv.shutdown()
+
+
 class Server(ThreadingHTTPServer):
     def server_bind(self):
         # Sin socket.getfqdn() de HTTPServer: el DNS inverso tarda ~35 s en Macs sin red/DNS lento (runners de CI).
@@ -684,12 +693,19 @@ def main():
     )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8780, help="0 = puerto libre al azar")
-    ap.add_argument("--token", default=None, help="secreto exigido en el header X-Firma-Token")
+    ap.add_argument(  # mejor por env: los argumentos de un proceso los ve cualquier usuario de la Mac con ps
+        "--token",
+        default=os.environ.get("FIRMA_TOKEN"),
+        help="secreto exigido en X-Firma-Token (default: env FIRMA_TOKEN)",
+    )
     ap.add_argument("--lt", action="store_true", default=LT, help="firmar PAdES-B-LT (embebe CRL/OCSP, ~9 MB con ONTI)")
     ap.add_argument(
         "--tsa",
         default=TSA or "none",
         help=f"URL de la TSA RFC 3161 (default: env FIRMA_TSA o {DEFAULT_TSA}); none = sin sello",
+    )
+    ap.add_argument(
+        "--parent-pid", type=int, default=None, help="terminar cuando muera este proceso padre (lo pasa la app)"
     )
     ap.add_argument("-v", action="store_true", help="log debug")
     a = ap.parse_args()
@@ -707,6 +723,8 @@ def main():
     srv = Server((a.host, a.port), Handler)
     log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, srv.server_address[1], LIB)
     print(f"READY port={srv.server_address[1]}", flush=True)  # la app parsea esta linea
+    if a.parent_pid:
+        threading.Thread(target=watch_parent, args=(a.parent_pid, srv), daemon=True).start()
     if LT:
         threading.Thread(target=prewarm, daemon=True).start()
     try:

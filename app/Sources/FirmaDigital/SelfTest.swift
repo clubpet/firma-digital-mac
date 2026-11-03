@@ -37,7 +37,7 @@ enum SelfTest {
                 let click = i == 4 // ultima pagina: click simple -> recuadro por defecto 220x60
                 let a = CGPoint(x: pv.minX + pv.width * 0.22, y: pv.minY + pv.height * 0.31)
                 let b = click ? a : CGPoint(x: pv.minX + pv.width * 0.71, y: pv.minY + pv.height * 0.44)
-                func ev(_ t: NSEvent.EventType, _ p: CGPoint) -> NSEvent {
+                @MainActor func ev(_ t: NSEvent.EventType, _ p: CGPoint) -> NSEvent {
                     NSEvent.mouseEvent(with: t, location: v.convert(p, to: nil), modifierFlags: [], timestamp: 0,
                                        windowNumber: win.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
                 }
@@ -221,7 +221,7 @@ enum SelfTest {
 final class FakeDrag: NSObject, NSDraggingInfo {
     let draggingPasteboard: NSPasteboard
     let draggingDestinationWindow: NSWindow?
-    init(_ pb: NSPasteboard, window: NSWindow) { draggingPasteboard = pb; draggingDestinationWindow = window }
+    @MainActor init(_ pb: NSPasteboard, window: NSWindow) { draggingPasteboard = pb; draggingDestinationWindow = window }
     var draggingSourceOperationMask: NSDragOperation { .copy }
     var draggingLocation: NSPoint { .zero }
     var draggedImageLocation: NSPoint { .zero }

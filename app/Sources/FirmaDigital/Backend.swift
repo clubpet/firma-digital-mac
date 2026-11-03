@@ -47,6 +47,7 @@ struct BackendError: LocalizedError {
 /// Lanza el motor de firma (binario empaquetado o firma.py en desarrollo) y habla HTTP con el en 127.0.0.1.
 final class Backend: @unchecked Sendable {
     private var process: Process?
+    private var stdout: Pipe?
     private(set) var port: Int?
     var pid: Int32? { process?.processIdentifier }
     private let secret = UUID().uuidString + UUID().uuidString
@@ -99,7 +100,11 @@ final class Backend: @unchecked Sendable {
 
         let p = Process()
         p.executableURL = exe
-        p.arguments = pre + ["--port", "0", "--lib", lib, "--trust", trust, "--token", secret]
+        // --parent-pid: si la app muere sin llamar /shutdown (crash, kill -9) el motor se cierra solo.
+        p.arguments = pre + ["--port", "0", "--lib", lib, "--trust", trust,
+                             "--parent-pid", String(ProcessInfo.processInfo.processIdentifier)]
+        // El secreto va por env y no por --token: los argumentos los ve cualquier usuario de la Mac con ps.
+        p.environment = env.merging(["FIRMA_TOKEN": secret]) { $1 }
         p.currentDirectoryURL = dir
         let out = Pipe()
         p.standardOutput = out
@@ -112,33 +117,18 @@ final class Backend: @unchecked Sendable {
         stopping = false
         try p.run()
         process = p
+        stdout = out
 
-        let port: Int = try await withCheckedThrowingContinuation { cont in
-            var buf = Data()
-            var done = false
-            let finish: (Result<Int, Error>) -> Void = { r in
-                guard !done else { return }
-                done = true
-                out.fileHandleForReading.readabilityHandler = nil
-                cont.resume(with: r)
-            }
-            let q = DispatchQueue(label: "backend.ready")
-            out.fileHandleForReading.readabilityHandler = { h in
-                let chunk = h.availableData
-                q.sync {
-                    if chunk.isEmpty { return finish(.failure(BackendError(message: "El motor de firma no arrancó."))) }
-                    buf.append(chunk)
-                    let s = String(decoding: buf, as: UTF8.self)
-                    if let r = s.range(of: #"READY port=(\d+)"#, options: .regularExpression),
-                       let n = Int(s[r].split(separator: "=")[1]) {
-                        finish(.success(n))
-                    }
-                }
-            }
-            q.asyncAfter(deadline: .now() + 90) { finish(.failure(BackendError(message: "El motor de firma tardó demasiado en arrancar."))) }
+        let port: Int
+        do {
+            port = try await ReadyWaiter().wait(out.fileHandleForReading, timeout: 90)
+        } catch {
+            stop() // sin READY (colgado o caido): no dejar el proceso vivo; la UI ofrece "Reiniciar motor"
+            throw error
         }
-        // Despues de READY seguimos drenando stdout para que el pipe nunca se llene.
-        out.fileHandleForReading.readabilityHandler = { h in _ = h.availableData }
+        // Despues de READY seguimos drenando stdout para que el pipe nunca se llene. En EOF (motor caido) hay que
+        // soltar el handler: si no, se llama en loop con datos vacios y la app queda al 100% de CPU.
+        out.fileHandleForReading.readabilityHandler = { h in if h.availableData.isEmpty { h.readabilityHandler = nil } }
         self.port = port
         return port
     }
@@ -154,6 +144,8 @@ final class Backend: @unchecked Sendable {
             _ = sem.wait(timeout: .now() + 1)
         }
         if p.isRunning { p.terminate() }
+        stdout?.fileHandleForReading.readabilityHandler = nil
+        stdout = nil
         process = nil
         port = nil
     }
@@ -170,29 +162,27 @@ final class Backend: @unchecked Sendable {
             r.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
             var body = Data()
             for (name, value) in form {
-                body.append("--\(boundary)\r\n".data(using: .utf8)!)
+                body.append(Data("--\(boundary)\r\n".utf8))
                 if let (filename, data) = value as? (String, Data) {
                     let safe = filename.replacingOccurrences(of: "\"", with: "")
-                    body.append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(safe)\"\r\nContent-Type: application/pdf\r\n\r\n".data(using: .utf8)!)
+                    body.append(Data("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(safe)\"\r\nContent-Type: application/pdf\r\n\r\n".utf8))
                     body.append(data)
                 } else {
-                    body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)".data(using: .utf8)!)
+                    body.append(Data("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)".utf8))
                 }
-                body.append("\r\n".data(using: .utf8)!)
+                body.append(Data("\r\n".utf8))
             }
-            body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+            body.append(Data("--\(boundary)--\r\n".utf8))
             r.httpBody = body
         }
         return r
     }
 
     private func send(_ r: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        do {
-            let (d, resp) = try await URLSession.shared.data(for: r)
-            return (d, resp as! HTTPURLResponse)
-        } catch {
+        guard let (d, resp) = try? await URLSession.shared.data(for: r), let http = resp as? HTTPURLResponse else {
             throw BackendError(message: "No se pudo comunicar con el motor de firma.")
         }
+        return (d, http)
     }
 
     private static func errorText(_ d: Data) -> String {
@@ -228,5 +218,39 @@ final class Backend: @unchecked Sendable {
             throw BackendError(message: Self.errorText(d), pinWarning: h("X-Pin-Attempts-Left"))
         }
         return SignResult(pdf: d, filename: h("X-Filename"), level: h("X-Level"), signer: h("X-Signer"))
+    }
+}
+
+/// Junta stdout del motor hasta "READY port=N". Resuelve una sola vez: READY, EOF (no arranco) o timeout.
+private final class ReadyWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buf = Data()
+    private var cont: CheckedContinuation<Int, Error>?
+
+    func wait(_ h: FileHandle, timeout: TimeInterval) async throws -> Int {
+        try await withCheckedThrowingContinuation { c in
+            lock.withLock { cont = c }
+            h.readabilityHandler = { [self] h in
+                let chunk = h.availableData
+                if chunk.isEmpty {
+                    h.readabilityHandler = nil
+                    return finish(.failure(BackendError(message: "El motor de firma no arrancó.")))
+                }
+                let port: Int? = lock.withLock {
+                    buf.append(chunk)
+                    let s = String(decoding: buf, as: UTF8.self)
+                    guard let r = s.range(of: #"READY port=(\d+)"#, options: .regularExpression) else { return nil }
+                    return Int(s[r].split(separator: "=")[1])
+                }
+                if let port { finish(.success(port)) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [self] in
+                finish(.failure(BackendError(message: "El motor de firma tardó demasiado en arrancar.")))
+            }
+        }
+    }
+
+    private func finish(_ r: Result<Int, Error>) {
+        lock.withLock { () -> CheckedContinuation<Int, Error>? in defer { cont = nil }; return cont }?.resume(with: r)
     }
 }
