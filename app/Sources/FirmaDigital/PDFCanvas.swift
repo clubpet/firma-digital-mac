@@ -11,6 +11,8 @@ final class SignPDFView: PDFView {
     private(set) var sigRect: CGRect = .zero
     var onSigChange: ((PDFPage?, CGRect) -> Void)?
     var onDropURL: ((URL) -> Void)?
+    var onPageChange: ((Int) -> Void)?
+    private var lastPage = -1
 
     private let overlay = Overlay()
     private enum Drag { case new(CGPoint), move(CGRect, CGPoint), resize(CGRect, Edges) }
@@ -36,7 +38,15 @@ final class SignPDFView: PDFView {
         overlay.needsDisplay = true
     }
 
-    @objc private func refresh() { overlay.needsDisplay = true }
+    override var document: PDFDocument? { didSet { lastPage = -1; refresh() } }
+
+    @objc private func refresh() {
+        overlay.needsDisplay = true
+        if let p = currentPage, let i = document?.index(for: p), i != lastPage {
+            lastPage = i
+            DispatchQueue.main.async { self.onPageChange?(i) }
+        }
+    }
 
     override func layout() {
         super.layout()
@@ -207,20 +217,13 @@ struct PDFCanvas: NSViewRepresentable {
             state.sigRect = rect
         }
         v.onDropURL = { state.open($0) }
-        NotificationCenter.default.addObserver(forName: .PDFViewPageChanged, object: v, queue: .main) { _ in
-            MainActor.assumeIsolated {
-                if let p = v.currentPage, let d = v.document { state.currentPage = d.index(for: p) }
-            }
-        }
+        v.onPageChange = { state.currentPage = $0 }
         state.pdfView = v
         return v
     }
 
     func updateNSView(_ v: SignPDFView, context: Context) {
-        if v.document !== state.document {
-            v.document = state.document
-            state.currentPage = 0
-        }
+        if v.document !== state.document { v.document = state.document }
         v.editable = state.mode == .firmar
         v.stampLines = state.stampLines
         let page = state.sigPageIndex.flatMap { state.document?.page(at: $0) }

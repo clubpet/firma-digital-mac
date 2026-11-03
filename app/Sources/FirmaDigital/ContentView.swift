@@ -179,8 +179,10 @@ struct SignPanel: View {
         Label("Tres PIN incorrectos seguidos bloquean el token.", systemImage: "exclamationmark.shield")
             .font(.caption).foregroundStyle(.secondary)
 
-        if let w = state.pinWarning {
-            Label(Int(w).map { "Quedan \($0) intentos de PIN antes de que el token se bloquee." } ?? "Atención: \(w).",
+        if let w = state.pinWarning ?? ["bloqueado": "0", "ultimo_intento": "1", "bajo": "pocos"][state.token?.pin_status ?? ""] {
+            Label(w == "0" ? "El token está bloqueado. Hay que desbloquearlo con el PUK."
+                  : w == "1" ? "Atención: queda un solo intento. Si el PIN vuelve a fallar, el token se bloquea."
+                  : "Atención: quedan pocos intentos de PIN antes de que el token se bloquee.",
                   systemImage: "exclamationmark.octagon.fill")
                 .font(.callout.weight(.semibold)).foregroundStyle(.red)
         }

@@ -24,7 +24,8 @@ struct FirmaDigitalApp: App {
                 .onAppear {
                     delegate.state = state
                     if let u = delegate.pendingOpen { state.open(u); delegate.pendingOpen = nil }
-                    NSApp.activate(ignoringOtherApps: true)
+                    if ProcessInfo.processInfo.environment["FIRMA_SELFTEST"] == nil { NSApp.activate(ignoringOtherApps: true) }
+                    SelfTest.runIfRequested(state)
                 }
         }
         .commands {

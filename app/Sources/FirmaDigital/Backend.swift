@@ -4,7 +4,7 @@ import Foundation
 
 struct Status: Decodable {
     struct Cert: Decodable, Hashable { let label: String; let id: String; let cn: String; let subject: String; let valid_until: String }
-    struct Token: Decodable { let slot: Int; let label: String; let serial: String; let certs: [Cert] }
+    struct Token: Decodable { let slot: Int; let label: String; let serial: String; let certs: [Cert]; let pin_status: String? }
     let lib: String
     let lib_found: Bool
     let trust_roots: Int
@@ -214,11 +214,10 @@ final class Backend: @unchecked Sendable {
     }
 
     func sign(pdf: Data, name: String, pin: String, page: Int, rect: CGRect, reason: String, location: String, certID: String?) async throws -> SignResult {
-        // ponytail: puntos enteros (1 pt = 0,35 mm), el backend original parsea int.
+        let pt = { (v: CGFloat) in String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), Double(v)) }
         var form: [(String, Any)] = [
             ("pdf", (name, pdf)), ("pin", pin), ("page", page),
-            ("x", Int(rect.minX.rounded())), ("y", Int(rect.minY.rounded())),
-            ("w", Int(rect.width.rounded())), ("h", Int(rect.height.rounded())),
+            ("x", pt(rect.minX)), ("y", pt(rect.minY)), ("w", pt(rect.width)), ("h", pt(rect.height)),
             ("reason", reason), ("location", location),
         ]
         if let certID { form.append(("cert_id", certID)) }

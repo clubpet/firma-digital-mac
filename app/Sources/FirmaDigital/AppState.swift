@@ -118,6 +118,7 @@ final class AppState: ObservableObject {
         openError = nil
         docURL = url
         document = d
+        currentPage = 0
         sigPageIndex = nil; sigRect = .zero
         signError = nil; pinWarning = nil; signedURL = nil
         verification = nil; verifyError = nil
@@ -153,9 +154,12 @@ final class AppState: ObservableObject {
                 }
                 try r.pdf.write(to: dest, options: .atomic)
                 signedURL = dest
-                document = PDFDocument(url: dest)
+                let signed = PDFDocument(url: dest)
+                document = signed
                 docURL = dest
                 sigPageIndex = nil; sigRect = .zero
+                pdfView?.document = signed // ya, para poder quedarnos en la pagina firmada
+                goTo(page: page)
                 await verify(data: r.pdf, name: dest.lastPathComponent)
             } catch let e as BackendError {
                 signError = e.message
