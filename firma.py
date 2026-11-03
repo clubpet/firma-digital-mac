@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Firma Digital (Ley 25.506) de PDFs con token PKCS#11 — app web local minima.
 
-Uso: FIRMA_PKCS11_LIB=/ruta/lib.dylib python3 firma.py [--lib RUTA] [--port 8765]
+Uso: FIRMA_PKCS11_LIB=/ruta/lib.dylib python3 firma.py [--lib RUTA] [--port 8780]
 Raices de confianza opcionales: ./trust/*.pem (si existen, se valida cadena y se embebe CRL/OCSP = PAdES-B-LT).
 """
 import argparse
@@ -344,7 +344,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o SoftHSM)")
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("-v", action="store_true", help="log debug")
     a = ap.parse_args()
     LIB = a.lib

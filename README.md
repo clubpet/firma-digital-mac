@@ -2,7 +2,7 @@
 
 App web local minima para **firmar PDFs (PAdES)** con un token USB PKCS#11 (ej. mToken CryptoID) y
 **verificar firmas**. Un solo archivo Python (`firma.py`), stdlib + [pyHanko](https://pyhanko.readthedocs.io/).
-Corre en `http://127.0.0.1:8765`, no sale a la red salvo para bajar CRL/OCSP al firmar/verificar con raices.
+Corre en `http://127.0.0.1:8780`, no sale a la red salvo para bajar CRL/OCSP al firmar/verificar con raices.
 
 ## Instalacion
 
@@ -38,7 +38,7 @@ FIRMA_PKCS11_LIB=/ruta/al/driver.dylib .venv/bin/python firma.py
 SOFTHSM2_CONF=$PWD/dev/softhsm2.conf FIRMA_PKCS11_LIB=/opt/homebrew/lib/softhsm/libsofthsm2.so .venv/bin/python firma.py
 ```
 
-Abrir http://127.0.0.1:8765. Flags: `--lib RUTA`, `--port N`, `--host`, `-v` (debug).
+Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--port N`, `--host`, `-v` (debug).
 
 ## Uso
 
