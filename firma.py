@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Firma Digital (Ley 25.506) de PDFs con token PKCS#11 — app web local minima.
+"""Firma Digital (Ley 25.506) de PDFs con token PKCS#11: motor local HTTP de firma y verificacion.
 
-Uso: python3 firma.py [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO]
-Firma PAdES-B-B; con --lt (o FIRMA_LT=1) y ./trust embebe CRL/OCSP = PAdES-B-LT (la CRL de ONTI suma ~9 MB al PDF).
+Uso: python3 firma.py [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO] [--lt] [--tsa URL|none]
+Firma PAdES-B-T (sello de la TSA); --tsa none = PAdES-B-B; con --lt (o FIRMA_LT=1) y ./trust embebe CRL/OCSP =
+PAdES-B-LT (la CRL de ONTI suma ~9 MB al PDF).
+Modo web: sin --token, GET / sirve una pagina minima (pdf.js por CDN) para firmar y verificar desde el navegador.
+Con --token (asi la lanza la app) esa pagina no sirve: el navegador no manda X-Firma-Token y todo da 401.
 """
+
 import argparse
 import asyncio
 import dataclasses
@@ -29,6 +33,7 @@ from pyhanko.keys import load_certs_from_pemder
 from pyhanko.pdf_utils import generic, layout, text
 from pyhanko.pdf_utils.font.basic import SimpleFontEngineFactory
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+from pyhanko.pdf_utils.misc import PdfError
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers, validation
 from pyhanko.sign.pkcs11 import PKCS11Signer
@@ -73,6 +78,7 @@ log = logging.getLogger("firma")
 
 class FirmaError(RuntimeError):
     """Error con mensaje para el usuario, codigo HTTP y headers extra."""
+
     def __init__(self, msg, code=400, headers=()):
         super().__init__(msg)
         self.code, self.headers = code, list(headers)
@@ -102,11 +108,13 @@ def signing_context():
 def revinfo_ready(vc, cert):
     """Valida la cadena del firmante con vc (baja y cachea CRL/OCSP). True si hay con que hacer B-LT:
     cadena confiable y, si el cert publica CRL/OCSP, al menos una respuesta bajada. Llamar con VC_LOCK."""
+
     async def run():
         try:
             await CertificateValidator(cert, validation_context=vc).async_validate_usage(set())
         finally:
             await vc.aclose()
+
     try:
         asyncio.run(run())
     except Exception as e:
@@ -165,13 +173,16 @@ def lib_ok():
 
 
 def lib_error():
-    return (f"No se encuentra la libreria PKCS#11 en '{LIB}'. Instala el driver del token y "
-            "configura FIRMA_PKCS11_LIB (env) o --lib.")
+    return (
+        f"No se encuentra la libreria PKCS#11 en '{LIB}'. Instala el driver del token y "
+        "configura FIRMA_PKCS11_LIB (env) o --lib."
+    )
 
 
 def token_certs(token):
     """Certificados X.509 publicos del token (sin PIN). [(label, cert_id, Certificate)]."""
     from asn1crypto import x509
+
     with token.open() as s:
         objs = list(s.get_objects({Attribute.CLASS: ObjectClass.CERTIFICATE}))
         return [(o[Attribute.LABEL], o[Attribute.ID], x509.Certificate.load(o[Attribute.VALUE])) for o in objs]
@@ -185,12 +196,24 @@ def status():
     try:
         with TOKEN_LOCK:
             for tok in tokens():
-                out["tokens"].append({
-                    "slot": tok.slot.slot_id, "label": tok.label.strip(), "serial": tok.serial.decode(errors="replace").strip(),
-                    "pin_status": pin_state(tok),
-                    "certs": [{"label": lbl, "id": cid.hex(), "cn": cert_cn(c), "subject": c.subject.human_friendly,
-                               "valid_until": c.not_valid_after.isoformat()} for lbl, cid, c in token_certs(tok)],
-                })
+                out["tokens"].append(
+                    {
+                        "slot": tok.slot.slot_id,
+                        "label": tok.label.strip(),
+                        "serial": tok.serial.decode(errors="replace").strip(),
+                        "pin_status": pin_state(tok),
+                        "certs": [
+                            {
+                                "label": lbl,
+                                "id": cid.hex(),
+                                "cn": cert_cn(c),
+                                "subject": c.subject.human_friendly,
+                                "valid_until": c.not_valid_after.isoformat(),
+                            }
+                            for lbl, cid, c in token_certs(tok)
+                        ],
+                    }
+                )
     except Exception as e:  # lib que no carga (arquitectura, dependencias) o error del token
         out["error"] = out["pkcs11_error"] = f"Error PKCS#11: {type(e).__name__} {e}"
     return out
@@ -236,6 +259,7 @@ def pick_cert(token, cert_id=None):
 @dataclasses.dataclass(frozen=True)
 class RotatedTextStampStyle(stamp.TextStampStyle):
     """Sello que contrarrota su apariencia segun /Rotate de la pagina para leerse derecho en pantalla."""
+
     rotate: int = 0
 
     def create_stamp(self, writer, box, text_params):
@@ -250,6 +274,7 @@ class RotatedTextStampStyle(stamp.TextStampStyle):
                 xo = orig()  # el visor ajusta BBox*Matrix al /Rect (ISO 32000 12.5.5)
                 xo["/Matrix"] = generic.ArrayObject([generic.NumberObject(v) for v in (*mat, 0, 0)])
                 return xo
+
             st.as_form_xobject = as_form_xobject
         return st
 
@@ -281,6 +306,8 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
     if not lib_ok():
         raise FirmaError(lib_error(), 409)
     r = PdfFileReader(io.BytesIO(pdf_bytes))
+    if r.encrypted:
+        raise FirmaError("El PDF esta protegido con contrasena: quitale la proteccion antes de firmarlo.")
     n = len(r.embedded_signatures) + 1
     if not 1 <= page <= r.root["/Pages"]["/Count"]:
         raise FirmaError(f"La pagina {page} no existe.")
@@ -298,9 +325,11 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
                     session = token.open(user_pin=pin)
                 except (pkcs11.PinIncorrect, pkcs11.PinLocked) as e:
                     st = "bloqueado" if isinstance(e, pkcs11.PinLocked) else pin_state(token)
-                    msg = {"bloqueado": "PIN bloqueado: demasiados intentos fallidos. Desbloquealo con el PUK.",
-                           "ultimo_intento": "PIN incorrecto. Queda 1 intento: si vuelve a fallar el token se bloquea.",
-                           "bajo": "PIN incorrecto. Ya hubo intentos fallidos: con 3 seguidos el token se bloquea."}.get(st, "PIN incorrecto.")
+                    msg = {
+                        "bloqueado": "PIN bloqueado: demasiados intentos fallidos. Desbloquealo con el PUK.",
+                        "ultimo_intento": "PIN incorrecto. Queda 1 intento: si vuelve a fallar el token se bloquea.",
+                        "bajo": "PIN incorrecto. Ya hubo intentos fallidos: con 3 seguidos el token se bloquea.",
+                    }.get(st, "PIN incorrecto.")
                     hdr = [("X-Pin-Attempts-Left", PIN_HEADER[st])] if st in PIN_HEADER else []
                     raise FirmaError(msg, 423 if st == "bloqueado" else 403, hdr)
                 except pkcs11.PinLenRange:
@@ -309,22 +338,32 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
                     # en el mToken el label de la clave difiere del cert; coinciden por CKA_ID
                     signer = PKCS11Signer(session, cert_id=cid, key_id=cid)
                     meta = signers.PdfSignatureMetadata(
-                        field_name=f"Firma{n}", md_algorithm="sha256", reason=reason or None, location=location or None,
+                        field_name=f"Firma{n}",
+                        md_algorithm="sha256",
+                        reason=reason or None,
+                        location=location or None,
                         subfilter=fields.SigSeedSubFilter.PADES,
-                        embed_validation_info=lt, validation_context=vc if lt else None,
+                        embed_validation_info=lt,
+                        validation_context=vc if lt else None,
                     )
                     style = RotatedTextStampStyle(
-                        stamp_text="Firmado digitalmente por\n%(signer)s\n%(ts)s", border_width=1,
-                        timestamp_format="%d/%m/%Y %H:%M:%S %Z", rotate=rot,
-                        text_box_style=text.TextBoxStyle(font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9),
+                        stamp_text="Firmado digitalmente por\n%(signer)s\n%(ts)s",
+                        border_width=1,
+                        timestamp_format="%d/%m/%Y %H:%M:%S %Z",
+                        rotate=rot,
+                        text_box_style=text.TextBoxStyle(
+                            font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9
+                        ),
                     )
                     spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + width, y + height))
 
                     def do_sign(ts):
                         out = io.BytesIO()
-                        signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec, timestamper=ts
-                                          ).sign_pdf(IncrementalPdfFileWriter(io.BytesIO(pdf_bytes)), output=out)
+                        signers.PdfSigner(
+                            meta, signer=signer, stamp_style=style, new_field_spec=spec, timestamper=ts
+                        ).sign_pdf(IncrementalPdfFileWriter(io.BytesIO(pdf_bytes)), output=out)
                         return out.getvalue()
+
                     ts_err = None
                     try:
                         signed = do_sign(timestamper())
@@ -343,8 +382,11 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
     if ts_err:
         level = f"PAdES-B-B (sin sello de tiempo: {ts_err})"
     elif LT and not lt:
-        level = ("PAdES-B-B (sin raices de confianza)" if vc is None else
-                 "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)") + (" con sello de tiempo" if TSA else "")
+        level = (
+            "PAdES-B-B (sin raices de confianza)"
+            if vc is None
+            else "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)"
+        ) + (" con sello de tiempo" if TSA else "")
     else:
         level = "PAdES-B-LT" if lt else "PAdES-B-T" if TSA else "PAdES-B-B"
     return signed, level, cert_cn(cert)
@@ -362,35 +404,51 @@ def verify_pdf(pdf_bytes):
     for sig in r.embedded_signatures:
         try:
             claimed = sig.self_reported_timestamp
-            kw = dict(allow_fetching=claimed is None, revocation_mode="soft-fail", algorithm_usage_policy=weak,
-                      **({"moment": claimed} if claimed else {}))
-            st = validation.validate_pdf_signature(sig, signer_validation_context=ValidationContext(trust_roots=roots, **kw),
-                                                   ts_validation_context=ValidationContext(trust_roots=ts_roots, **kw))
+            kw = dict(
+                allow_fetching=claimed is None,
+                revocation_mode="soft-fail",
+                algorithm_usage_policy=weak,
+                **({"moment": claimed} if claimed else {}),
+            )
+            st = validation.validate_pdf_signature(
+                sig,
+                signer_validation_context=ValidationContext(trust_roots=roots, **kw),
+                ts_validation_context=ValidationContext(trust_roots=ts_roots, **kw),
+            )
         except Exception as e:  # firma rota/ilegible: igual la reportamos
             res.append({"campo": sig.field_name, "error": f"{type(e).__name__}: {e}"})
             continue
         subj = st.signing_cert.subject.native
         cov = str(st.coverage).rsplit(".", 1)[-1]
-        res.append({
-            "campo": sig.field_name,
-            "firmante": subj.get("common_name", ""),
-            "serial_number": subj.get("serial_number", ""),  # en AR: "CUIL 20xxxxxxxx5"
-            "emisor": st.signing_cert.issuer.native.get("common_name", ""),
-            "fecha_firma": st.signer_reported_dt.isoformat() if st.signer_reported_dt else None,
-            "integra": bool(st.intact and st.valid),
-            "sin_modificar": bool(st.intact and st.valid and st.docmdp_ok is not False and cov in ("ENTIRE_FILE", "ENTIRE_REVISION")),
-            "cobertura": cov,
-            "modificaciones": str(st.modification_level).rsplit(".", 1)[-1] if st.modification_level else None,
-            "cadena_confiable": bool(st.trusted),
-            "motivo_confianza": ("sin raices de confianza (./trust vacio)" if not roots else
-                                 "OK" if st.trusted else (str(st.trust_problem_indic) if st.trust_problem_indic else "cadena no valida")),
-            "sello_de_tiempo": (tv := st.timestamp_validity) is not None,
-            "sello_de_tiempo_confiable": bool(tv and tv.trusted),
-            "sello_de_tiempo_fecha": tv.timestamp.isoformat() if tv else None,
-            "sello_de_tiempo_emisor": tv.signing_cert.subject.native.get("common_name", "") if tv else None,
-            "validado_a": "fecha de firma declarada" if claimed else "ahora",
-            "resumen": st.summary(),
-        })
+        res.append(
+            {
+                "campo": sig.field_name,
+                "firmante": subj.get("common_name", ""),
+                "serial_number": subj.get("serial_number", ""),  # en AR: "CUIL 20xxxxxxxx5"
+                "emisor": st.signing_cert.issuer.native.get("common_name", ""),
+                "fecha_firma": st.signer_reported_dt.isoformat() if st.signer_reported_dt else None,
+                "integra": bool(st.intact and st.valid),
+                "sin_modificar": bool(
+                    st.intact and st.valid and st.docmdp_ok is not False and cov in ("ENTIRE_FILE", "ENTIRE_REVISION")
+                ),
+                "cobertura": cov,
+                "modificaciones": str(st.modification_level).rsplit(".", 1)[-1] if st.modification_level else None,
+                "cadena_confiable": bool(st.trusted),
+                "motivo_confianza": (
+                    "sin raices de confianza (./trust vacio)"
+                    if not roots
+                    else "OK"
+                    if st.trusted
+                    else (str(st.trust_problem_indic) if st.trust_problem_indic else "cadena no valida")
+                ),
+                "sello_de_tiempo": (tv := st.timestamp_validity) is not None,
+                "sello_de_tiempo_confiable": bool(tv and tv.trusted),
+                "sello_de_tiempo_fecha": tv.timestamp.isoformat() if tv else None,
+                "sello_de_tiempo_emisor": tv.signing_cert.subject.native.get("common_name", "") if tv else None,
+                "validado_a": "fecha de firma declarada" if claimed else "ahora",
+                "resumen": st.summary(),
+            }
+        )
     return {"firmas": res, "raices_confianza": len(roots)}
 
 
@@ -431,7 +489,7 @@ button:disabled{opacity:.5} pre{background:#f7f7f5;padding:.7rem;border-radius:6
 <script>
 const $=s=>document.querySelector(s);
 fetch('/status').then(r=>r.json()).then(s=>{
- let t=`Librería: ${s.lib} ${s.lib_found?'(encontrada)':'(NO ENCONTRADA)'} · Raíces de confianza: ${s.trust_roots} → firma ${s.lt&&s.trust_roots?'PAdES-B-LT':'PAdES-B-B'}`;
+ let t=`Librería: ${s.lib} ${s.lib_found?'(encontrada)':'(NO ENCONTRADA)'} · Raíces de confianza: ${s.trust_roots} → firma ${s.lt&&s.trust_roots?'PAdES-B-LT':s.tsa?'PAdES-B-T':'PAdES-B-B'}`;
  if(s.error) t+=`\\n<span class=err>${s.error}</span>`;
  else if(!s.tokens.length) t+='\\n<span class=err>No hay token conectado.</span>';
  else for(const k of s.tokens) t+=`\\nToken "${k.label}" · certs: `+(k.certs.map(c=>`${c.label} (${c.cn})`).join(', ')||'ninguno');
@@ -476,12 +534,18 @@ pv.onpointerup=e=>{ if(!start)return; const [x,y,k]=pos(e); const [sx,sy]=start;
 def parse_multipart(handler):
     """Multipart con stdlib (email). Devuelve {name: str | (filename, bytes)}."""
     ct = handler.headers.get("Content-Type", "")
-    n = int(handler.headers.get("Content-Length", 0))
+    try:
+        n = int(handler.headers.get("Content-Length", 0))
+    except ValueError:
+        raise FirmaError("Content-Length invalido.")
+    if n < 0:
+        raise FirmaError("Content-Length invalido.")
     if n > 200 * 1024 * 1024:
-        raise RuntimeError("Archivo demasiado grande (max 200 MB).")
+        raise FirmaError("Archivo demasiado grande (max 200 MB).", 413)
     body = handler.rfile.read(n)
     msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
-        b"Content-Type: " + ct.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body)
+        b"Content-Type: " + ct.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
+    )
     out = {}
     for part in msg.iter_parts():
         name = part.get_param("name", header="content-disposition")
@@ -513,7 +577,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self):
-        if self.secret is None or hmac.compare_digest(self.headers.get("X-Firma-Token", "").encode(), self.secret.encode()):
+        if self.secret is None or hmac.compare_digest(
+            self.headers.get("X-Firma-Token", "").encode(), self.secret.encode()
+        ):
             return True
         self._send(401, "No autorizado.", "text/plain; charset=utf-8")
         return False
@@ -558,21 +624,40 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     raise FirmaError("page/x/y/w/h tienen que ser numeros.")
                 signed, level, cn = sign_pdf(
-                    pdf, pin, page=page, x=num["x"], y=num["y"], width=num["w"], height=num["h"],
-                    reason=form.get("reason"), location=form.get("location"), cert_id=form.get("cert_id") or None)
+                    pdf,
+                    pin,
+                    page=page,
+                    x=num["x"],
+                    y=num["y"],
+                    width=num["w"],
+                    height=num["h"],
+                    reason=form.get("reason"),
+                    location=form.get("location"),
+                    cert_id=form.get("cert_id") or None,
+                )
                 del pin, form
                 out = (os.path.splitext(fn or "documento")[0]) + "-firmado.pdf"
                 q = urllib.parse.quote(out)
-                self._send(200, signed, "application/pdf", [
-                    ("Content-Disposition", f"attachment; filename*=UTF-8''{q}"),
-                    ("X-Filename", q), ("X-Level", level), ("X-Signer", urllib.parse.quote(cn))])
+                self._send(
+                    200,
+                    signed,
+                    "application/pdf",
+                    [
+                        ("Content-Disposition", f"attachment; filename*=UTF-8''{q}"),
+                        ("X-Filename", q),
+                        ("X-Level", level),
+                        ("X-Signer", urllib.parse.quote(cn)),
+                    ],
+                )
             elif path == "/verify":
                 self._send(200, verify_pdf(pdf))
             else:
                 self._send(404, {"error": "no existe"})
         except Exception as e:
             log.debug(traceback.format_exc())
-            msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
+            if isinstance(e, PdfError):  # pyHanko no pudo leer/escribir el PDF
+                e = FirmaError(f"El archivo no es un PDF valido o esta danado ({e}).")
+            msg = str(e) if isinstance(e, FirmaError) else f"Error inesperado: {type(e).__name__}: {e}"
             code, hdrs = (e.code, e.headers) if isinstance(e, FirmaError) else (400, [])
             if path == "/sign":
                 self._send(code, msg, "text/plain; charset=utf-8", hdrs)
@@ -583,13 +668,21 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global LIB, TRUST_DIR, LT, TSA
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o autodeteccion)")
-    ap.add_argument("--trust", default=TRUST_DIR, help="carpeta de raices de confianza (default: env FIRMA_TRUST_DIR o ./trust)")
+    ap.add_argument(
+        "--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o autodeteccion)"
+    )
+    ap.add_argument(
+        "--trust", default=TRUST_DIR, help="carpeta de raices de confianza (default: env FIRMA_TRUST_DIR o ./trust)"
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8780, help="0 = puerto libre al azar")
     ap.add_argument("--token", default=None, help="secreto exigido en el header X-Firma-Token")
     ap.add_argument("--lt", action="store_true", default=LT, help="firmar PAdES-B-LT (embebe CRL/OCSP, ~9 MB con ONTI)")
-    ap.add_argument("--tsa", default=TSA or "none", help=f"URL de la TSA RFC 3161 (default: env FIRMA_TSA o {DEFAULT_TSA}); none = sin sello")
+    ap.add_argument(
+        "--tsa",
+        default=TSA or "none",
+        help=f"URL de la TSA RFC 3161 (default: env FIRMA_TSA o {DEFAULT_TSA}); none = sin sello",
+    )
     ap.add_argument("-v", action="store_true", help="log debug")
     a = ap.parse_args()
     LIB, TRUST_DIR, LT, Handler.secret = a.lib, a.trust, a.lt, a.token
@@ -601,7 +694,8 @@ def main():
     if not lib_ok():
         log.warning(lib_error())
     n = len(trust_roots())
-    log.info("Raices de confianza en %s: %d; firma %s; TSA %s", TRUST_DIR, n, "PAdES-B-LT" if LT and n else "PAdES-B-B", TSA)
+    level = "PAdES-B-LT" if LT and n else "PAdES-B-T" if TSA else "PAdES-B-B"
+    log.info("Raices de confianza en %s: %d; firma %s; TSA %s", TRUST_DIR, n, level, TSA)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, srv.server_address[1], LIB)
     print(f"READY port={srv.server_address[1]}", flush=True)  # la app parsea esta linea

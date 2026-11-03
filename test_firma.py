@@ -4,6 +4,7 @@
 Uso: .venv/bin/python test_firma.py                         (firma.py)
      FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py   (binario congelado)
 """
+
 import io
 import json
 import os
@@ -12,15 +13,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
-import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.environ.get("FIRMA_PKCS11_LIB", "/opt/homebrew/lib/softhsm/libsofthsm2.so")
-BACKEND = [os.environ["FIRMA_BACKEND"]] if os.environ.get("FIRMA_BACKEND") else [sys.executable, os.path.join(HERE, "firma.py")]
+BACKEND = (
+    [os.environ["FIRMA_BACKEND"]]
+    if os.environ.get("FIRMA_BACKEND")
+    else [sys.executable, os.path.join(HERE, "firma.py")]
+)
 SECRET = secrets.token_hex(16)
 BASE = None
 
@@ -32,7 +37,9 @@ def multipart(fields):
         body.write(f"--{b}\r\n".encode())
         if isinstance(v, tuple):
             fn, data = v
-            body.write(f'Content-Disposition: form-data; name="{k}"; filename="{fn}"\r\nContent-Type: application/pdf\r\n\r\n'.encode())
+            body.write(
+                f'Content-Disposition: form-data; name="{k}"; filename="{fn}"\r\nContent-Type: application/pdf\r\n\r\n'.encode()
+            )
             body.write(data)
         else:
             body.write(f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}'.encode())
@@ -56,8 +63,11 @@ def req(path, fields=None, token=SECRET):
 
 def make_pdf(rotate=None, crop=None):
     from pyhanko.pdf_utils import generic, writer
-    page = {"/Type": generic.pdf_name("/Page"),
-            "/MediaBox": generic.ArrayObject([generic.NumberObject(n) for n in (0, 0, 595, 842)])}
+
+    page = {
+        "/Type": generic.pdf_name("/Page"),
+        "/MediaBox": generic.ArrayObject([generic.NumberObject(n) for n in (0, 0, 595, 842)]),
+    }
     if rotate:
         page["/Rotate"] = generic.NumberObject(rotate)
     if crop:
@@ -71,6 +81,7 @@ def make_pdf(rotate=None, crop=None):
 
 def widget(pdf):
     from pyhanko.pdf_utils.reader import PdfFileReader
+
     f = PdfFileReader(io.BytesIO(pdf)).root["/AcroForm"]["/Fields"][-1].get_object()
     return [float(v) for v in f["/Rect"]], f["/AP"]["/N"].get_object()
 
@@ -80,23 +91,112 @@ def add_ca_cert(trust, tsa_dir):
     Tambien un cert de TSA emitido por la misma CA (tsa_dir/tsa.pem + tsa.key)."""
     d = tempfile.mkdtemp()
     run = lambda *a: subprocess.run(a, check=True, capture_output=True, cwd=d)
-    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-keyout", "ca.key", "-out", "ca.pem",
-        "-subj", "/C=AR/O=Prueba/CN=CA Prueba")
-    run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "k.pem", "-out", "c.csr",
-        "-subj", "/C=AR/O=Prueba/CN=Ana Gomez/serialNumber=CUIL 27123456784")
+    run(
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "3650",
+        "-keyout",
+        "ca.key",
+        "-out",
+        "ca.pem",
+        "-subj",
+        "/C=AR/O=Prueba/CN=CA Prueba",
+    )
+    run(
+        "openssl",
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        "k.pem",
+        "-out",
+        "c.csr",
+        "-subj",
+        "/C=AR/O=Prueba/CN=Ana Gomez/serialNumber=CUIL 27123456784",
+    )
     open(os.path.join(d, "ext.cnf"), "w").write(
-        "keyUsage=critical,digitalSignature,nonRepudiation\ncrlDistributionPoints=URI:http://127.0.0.1:9/ca.crl\n")
-    run("openssl", "x509", "-req", "-in", "c.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "3650",
-        "-sha256", "-extfile", "ext.cnf", "-out", "c.pem")
+        "keyUsage=critical,digitalSignature,nonRepudiation\ncrlDistributionPoints=URI:http://127.0.0.1:9/ca.crl\n"
+    )
+    run(
+        "openssl",
+        "x509",
+        "-req",
+        "-in",
+        "c.csr",
+        "-CA",
+        "ca.pem",
+        "-CAkey",
+        "ca.key",
+        "-CAcreateserial",
+        "-days",
+        "3650",
+        "-sha256",
+        "-extfile",
+        "ext.cnf",
+        "-out",
+        "c.pem",
+    )
     run("openssl", "x509", "-in", "c.pem", "-outform", "DER", "-out", "c.der")
     run("softhsm2-util", "--import", "k.pem", "--token", "FirmaDev", "--pin", "1234", "--label", "firma2", "--id", "02")
-    run("pkcs11-tool", "--module", LIB, "--token-label", "FirmaDev", "--login", "--pin", "1234",
-        "--write-object", "c.der", "--type", "cert", "--label", "firma2", "--id", "02")
-    open(os.path.join(d, "tsa.cnf"), "w").write("extendedKeyUsage=critical,timeStamping\nkeyUsage=critical,digitalSignature\n")
-    run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", os.path.join(tsa_dir, "tsa.key"), "-out", "t.csr",
-        "-subj", "/C=AR/O=Prueba/CN=TSA Prueba")
-    run("openssl", "x509", "-req", "-in", "t.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "3650",
-        "-sha256", "-extfile", "tsa.cnf", "-out", os.path.join(tsa_dir, "tsa.pem"))
+    run(
+        "pkcs11-tool",
+        "--module",
+        LIB,
+        "--token-label",
+        "FirmaDev",
+        "--login",
+        "--pin",
+        "1234",
+        "--write-object",
+        "c.der",
+        "--type",
+        "cert",
+        "--label",
+        "firma2",
+        "--id",
+        "02",
+    )
+    open(os.path.join(d, "tsa.cnf"), "w").write(
+        "extendedKeyUsage=critical,timeStamping\nkeyUsage=critical,digitalSignature\n"
+    )
+    run(
+        "openssl",
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        os.path.join(tsa_dir, "tsa.key"),
+        "-out",
+        "t.csr",
+        "-subj",
+        "/C=AR/O=Prueba/CN=TSA Prueba",
+    )
+    run(
+        "openssl",
+        "x509",
+        "-req",
+        "-in",
+        "t.csr",
+        "-CA",
+        "ca.pem",
+        "-CAkey",
+        "ca.key",
+        "-CAcreateserial",
+        "-days",
+        "3650",
+        "-sha256",
+        "-extfile",
+        "tsa.cnf",
+        "-out",
+        os.path.join(tsa_dir, "tsa.pem"),
+    )
     shutil.copy(os.path.join(d, "ca.pem"), os.path.join(trust, "ca.pem"))
     shutil.rmtree(d)
 
@@ -106,8 +206,11 @@ def mock_tsa(tsa_dir):
     from asn1crypto import tsp
     from pyhanko.keys import load_cert_from_pemder, load_private_key_from_pemder
     from pyhanko.sign.timestamps import DummyTimeStamper
-    ts = DummyTimeStamper(load_cert_from_pemder(os.path.join(tsa_dir, "tsa.pem")),
-                          load_private_key_from_pemder(os.path.join(tsa_dir, "tsa.key"), None))
+
+    ts = DummyTimeStamper(
+        load_cert_from_pemder(os.path.join(tsa_dir, "tsa.pem")),
+        load_private_key_from_pemder(os.path.join(tsa_dir, "tsa.key"), None),
+    )
 
     class H(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -121,6 +224,7 @@ def mock_tsa(tsa_dir):
 
         def log_message(self, *a):
             pass
+
     srv = HTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return f"http://127.0.0.1:{srv.server_address[1]}/tsa"
@@ -129,8 +233,11 @@ def mock_tsa(tsa_dir):
 def start(trust, *extra):
     global BASE
     t0 = time.time()
-    srv = subprocess.Popen(BACKEND + ["--port", "0", "--token", SECRET, "--lib", LIB, "--trust", trust, *extra],
-                           stdout=subprocess.PIPE, text=True)
+    srv = subprocess.Popen(
+        BACKEND + ["--port", "0", "--token", SECRET, "--lib", LIB, "--trust", trust, *extra],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
     line = srv.stdout.readline().strip()
     assert line.startswith("READY port="), line
     BASE = f"http://127.0.0.1:{int(line.split('=')[1])}"
@@ -145,6 +252,7 @@ def stop(srv):
 
 def has_dss(pdf):
     from pyhanko.pdf_utils.reader import PdfFileReader
+
     return "/DSS" in PdfFileReader(io.BytesIO(pdf)).root
 
 
@@ -158,7 +266,6 @@ def main():
     tsa = mock_tsa(tsa_dir)
     srv = start(trust, "--tsa", tsa)
     try:
-
         assert req("/health", token=None)[0] == 401 and req("/health", token="otro")[0] == 401
         code, body, _ = req("/health")
         assert code == 200 and json.loads(body)["ok"], body
@@ -178,8 +285,20 @@ def main():
         times = []
         for _ in range(3):
             t = time.time()
-            code, signed, h = req("/sign", {"pdf": ("contrato.pdf", pdf), "pin": "1234", "reason": "Prueba",
-                                            "location": "Neuquen", "cert_id": "01", "x": "50.5", "y": "60", "w": "200", "h": "50"})
+            code, signed, h = req(
+                "/sign",
+                {
+                    "pdf": ("contrato.pdf", pdf),
+                    "pin": "1234",
+                    "reason": "Prueba",
+                    "location": "Neuquen",
+                    "cert_id": "01",
+                    "x": "50.5",
+                    "y": "60",
+                    "w": "200",
+                    "h": "50",
+                },
+            )
             times.append(time.time() - t)
             assert code == 200, signed.decode()
         print("firmado:", h["X-Level"], h["X-Filename"], len(signed), "bytes; tiempos", [round(x, 3) for x in times])
@@ -193,10 +312,14 @@ def main():
         f = v[0]
         assert f["firmante"] == "Juan Perez" and f["serial_number"] == "CUIL 20123456785"
         assert f["integra"] and f["sin_modificar"] and f["cadena_confiable"], f
-        assert f["sello_de_tiempo"] and f["sello_de_tiempo_confiable"] and f["sello_de_tiempo_emisor"] == "TSA Prueba", f
+        assert (
+            f["sello_de_tiempo"] and f["sello_de_tiempo_confiable"] and f["sello_de_tiempo_emisor"] == "TSA Prueba"
+        ), f
 
         # segunda firma con cert 02 elegido por cert_id
-        code, signed2, h = req("/sign", {"pdf": ("c.pdf", signed), "pin": "1234", "cert_id": "02", "x": "300", "y": "60"})
+        code, signed2, h = req(
+            "/sign", {"pdf": ("c.pdf", signed), "pin": "1234", "cert_id": "02", "x": "300", "y": "60"}
+        )
         assert code == 200, signed2.decode()
         assert h["X-Level"] == "PAdES-B-T" and h["X-Signer"] == "Ana%20Gomez", h
         v = json.loads(req("/verify", {"pdf": ("x.pdf", signed2)})[1])["firmas"]
@@ -204,7 +327,10 @@ def main():
         assert req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234", "cert_id": "ff"})[0] == 404
 
         # pagina rotada 90: /Rect tal cual (espacio de usuario) y apariencia contrarrotada con caja transpuesta
-        code, s, _ = req("/sign", {"pdf": ("r.pdf", make_pdf(rotate=90)), "pin": "1234", "x": "100", "y": "200", "w": "60", "h": "220"})
+        code, s, _ = req(
+            "/sign",
+            {"pdf": ("r.pdf", make_pdf(rotate=90)), "pin": "1234", "x": "100", "y": "200", "w": "60", "h": "220"},
+        )
         assert code == 200, s.decode()
         rect, ap = widget(s)
         assert rect == [100, 200, 160, 420] and [float(v) for v in ap["/Matrix"]] == [0, 1, -1, 0, 0, 0], (rect, ap)
@@ -241,7 +367,10 @@ def main():
         stop(srv)
 
         # --tsa none -> B-B; TSA caida -> firma igual sin sello y lo dice
-        for args, want in ((["--tsa", "none"], "PAdES-B-B"), (["--tsa", "http://127.0.0.1:9/tsa"], "PAdES-B-B (sin sello de tiempo:")):
+        for args, want in (
+            (["--tsa", "none"], "PAdES-B-B"),
+            (["--tsa", "http://127.0.0.1:9/tsa"], "PAdES-B-B (sin sello de tiempo:"),
+        ):
             srv = start(trust, *args)
             code, s, h = req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234"})
             print(args[1], "->", h.get("X-Level"))
@@ -259,7 +388,9 @@ def main():
         else:
             print("TSA real no disponible, salteado:", h.get("X-Level"))
         stop(srv)
-        print("OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown")
+        print(
+            "OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown"
+        )
     finally:
         if srv.poll() is None:
             srv.terminate()

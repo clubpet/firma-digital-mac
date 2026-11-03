@@ -1,0 +1,12 @@
+# Solo configuracion de ruff (no es un paquete instalable).
+[tool.ruff]
+line-length = 120
+target-version = "py310"  # pyHanko 0.38 pide >=3.10
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # lineas largas: el estilo del repo es denso; ruff format no las parte en strings/HTML
+    "E731",  # lambdas asignadas (helpers de una linea en los tests)
+    "B904",  # raise sin from dentro de except: los FirmaError son mensajes para el usuario
+]
