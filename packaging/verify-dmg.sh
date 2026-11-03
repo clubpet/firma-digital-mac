@@ -1,7 +1,8 @@
 #!/bin/bash
+# shellcheck disable=SC2015 # "A && ok || bad": ok/bad/note son echo y no fallan
 # Uso: packaging/verify-dmg.sh "packaging/dist/Firma Digital-<version>.dmg"
 # Monta read-only, verifica firma, Gatekeeper, backend y dylib, y desmonta. Sale != 0 si algo esencial falla.
-set -uo pipefail
+set -uo pipefail  # sin -e a proposito: junta todas las fallas y sale con FAIL
 
 DMG="${1:?uso: verify-dmg.sh <dmg>}"
 MNT="$(mktemp -d)"
@@ -10,6 +11,7 @@ ok()   { echo "OK    $*"; }
 bad()  { echo "FALLA $*"; FAIL=1; }
 note() { echo "AVISO $*"; }
 
+# shellcheck disable=SC2329 # la invoca el trap EXIT
 cleanup() {
   [ -n "${BPID:-}" ] && kill "$BPID" 2>/dev/null
   hdiutil detach -quiet "$MNT" 2>/dev/null || hdiutil detach -force -quiet "$MNT"
@@ -59,6 +61,7 @@ fi
 
 echo "== Driver"
 DRV="$APP/Contents/Resources/driver"
+# shellcheck disable=SC2012 # solo para mostrar
 ls -la "$DRV" 2>/dev/null | sed 's/^/      /'
 [ -n "$(find "$DRV" -name '*.dylib' 2>/dev/null)" ] || bad "no hay dylib en $DRV"
 while IFS= read -r -d '' d; do

@@ -15,7 +15,9 @@ warn() { printf '\033[33mAVISO:\033[0m %s\n' "$*" >&2; }
 
 cd "$APP_DIR"
 ARCHS="--arch arm64 --arch x86_64"
+# shellcheck disable=SC2086 # $ARCHS se parte en palabras a proposito (vacio = solo la arquitectura local)
 swift build -c release $ARCHS || { warn "build universal fallo, compilo solo arm64"; ARCHS=""; swift build -c release; }
+# shellcheck disable=SC2086
 BIN="$(swift build -c release $ARCHS --show-bin-path)/FirmaDigital"
 
 rm -rf "$APP"
