@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: brew install softhsm opensc
+      - name: Build backend (PyInstaller)
+        run: python -m venv .venv && sh build-backend.sh
+      - name: Test firma.py contra SoftHSM
+        run: .venv/bin/python test_firma.py
+      - name: Test binario congelado
+        run: FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py
+      # tar: upload-artifact pierde los permisos de ejecucion
+      - run: tar -czf firma-backend.tgz dist/firma-backend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firma-backend
+          path: firma-backend.tgz
+          retention-days: 3
+
+  app:
+    needs: backend
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: firma-backend
+      - run: tar -xzf firma-backend.tgz
+      - uses: actions/cache@v4
+        with:
+          path: vendor
+          key: driver-${{ hashFiles('app/fetch-driver.sh') }}
+      - name: Build app (fetch-driver.sh + swift build universal)
+        run: sh app/build-app.sh
+      - name: Check bundle
+        run: |
+          APP="app/build/Firma Digital.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$(cat VERSION)"
+          test -x "$APP/Contents/Resources/backend/firma-backend/firma-backend"
+          test -f "$APP/Contents/Resources/driver/liblm_cryptoide_pkcs11.dylib"
+          lipo -info "$APP/Contents/MacOS/FirmaDigital"
+          codesign --verify --deep --strict "$APP"
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning $(git ls-files '*.sh')

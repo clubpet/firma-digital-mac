@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Solo armar el DMG y subirlo como artifact (sin release)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: VERSION == tag
+        id: v
+        run: |
+          V=$(cat VERSION)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$V" ]; then
+            echo "::error::VERSION ($V) no coincide con el tag $GITHUB_REF_NAME"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build backend (PyInstaller)
+        run: python -m venv .venv && sh build-backend.sh
+      - name: Build app (fetch-driver.sh verifica sha256 del driver)
+        run: sh app/build-app.sh
+      - name: DMG
+        run: bash packaging/make-dmg.sh "app/build/Firma Digital.app"
+      - name: Verify DMG
+        run: bash packaging/verify-dmg.sh "packaging/dist/Firma Digital-${{ steps.v.outputs.version }}.dmg"
+      - name: sha256 + notas
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          cd packaging/dist
+          DMG="Firma Digital-$V.dmg"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+          SHA=$(cut -d' ' -f1 "$DMG.sha256")
+          SECTION=$(awk -v v="$V" '/^## /{p = index($0, "## [" v "]") == 1; next} p' "$GITHUB_WORKSPACE/CHANGELOG.md")
+          [ -n "$SECTION" ] || { echo "::error::CHANGELOG.md no tiene seccion ## [$V]"; exit 1; }
+          {
+            echo "$SECTION"
+            echo
+            echo "### Descarga"
+            echo
+            echo "\`$DMG\` — sha256 \`$SHA\`"
+            echo
+            echo "Verificar: \`shasum -a 256 -c \"$DMG.sha256\"\`"
+            echo
+            echo "La app esta firmada ad-hoc (sin Developer ID ni notarizacion): la primera vez macOS la bloquea."
+            echo "Para abrirla: clic derecho sobre **Firma Digital** en Aplicaciones → **Abrir** → **Abrir**"
+            echo "(o Ajustes del Sistema → Privacidad y seguridad → **Abrir igualmente**). Detalle en \`LEEME.txt\` dentro del DMG."
+          } > notes.md
+          cat notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ steps.v.outputs.version }}
+          path: |
+            packaging/dist/*.dmg
+            packaging/dist/*.sha256
+            packaging/dist/notes.md
+      - name: GitHub release
+        if: github.ref_type == 'tag' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          cd packaging/dist
+          gh release create "v$V" --verify-tag --title "Firma Digital $V" --notes-file notes.md \
+            "Firma Digital-$V.dmg" "Firma Digital-$V.dmg.sha256"
