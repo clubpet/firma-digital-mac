@@ -145,8 +145,7 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, reason=None, location=None, cer
         except pkcs11.PinLocked:
             raise RuntimeError("PIN bloqueado: demasiados intentos fallidos.")
         with session:
-            # key_label/key_id: pyHanko busca la clave privada que coincida con el cert elegido
-            signer = PKCS11Signer(session, cert_label=label, cert_id=cert_id, key_label=label, key_id=cert_id)
+            signer = PKCS11Signer(session, cert_id=cert_id, key_id=cert_id)  # en el mToken el label de la clave difiere del cert; coinciden por CKA_ID
             vc = validation_context()
             r = PdfFileReader(io.BytesIO(pdf_bytes))
             n = len(r.embedded_signatures) + 1
