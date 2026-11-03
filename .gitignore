@@ -1,0 +1,6 @@
+.venv/
+dev/tokens/
+dev/softhsm2.conf
+dev/test-cert.pem
+__pycache__/
+*.pdf
