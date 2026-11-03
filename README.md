@@ -54,15 +54,29 @@ Abrir http://127.0.0.1:8765. Flags: `--lib RUTA`, `--port N`, `--host`, `-v` (de
 
 ## Raices de confianza (PAdES-B-LT y validacion de cadena)
 
-Poner los certificados raiz/intermedios en `./trust/*.pem` (o `.crt`): para Firma Digital Argentina, la
-**AC Raiz** y las AC subordinadas (AC ONTI / AC Modernizacion / AC de la Secretaria de Innovacion, segun
-quien emitio el certificado del token). Con `trust/` presente:
+`trust/` ya trae los 22 certificados oficiales de la PKI argentina (AC Raiz 2007 y 2016, AC ONTI, AC
+Modernizacion-PFDR, Encode, Lakaut, Box Custodia, Digilogix, AFIP, ANSES, etc.), identicos byte a byte al zip
+oficial `https://pki.jgm.gov.ar/docs/Certificados_AC_Manual.zip`; origen y huellas SHA-256 en `trust/README.md`.
+Con `trust/` presente:
 
 - al firmar se embeben CRL/OCSP de la cadena → **PAdES-B-LT**;
-- al verificar se valida la cadena contra esas raices.
+- al verificar se valida la cadena contra esas raices, con la misma semantica que el validador oficial
+  (https://validadordefirmas.gob.ar): cadena evaluada a la fecha de firma declarada, SHA-1 aceptado,
+  revocacion soft-fail (el OCSP de ONTI responde `unauthorized`, la CRL diaria si anda).
 
 Sin `trust/` se firma **PAdES-B-B** (la UI lo avisa) y la verificacion reporta "sin raices de confianza".
 `FIRMA_TRUST_DIR` cambia la carpeta (lo usa el test).
+
+## Validador oficial
+
+`python3 validador_oficial.py doc.pdf` sube el PDF a validadordefirmas.gob.ar (la API de la pagina
+https://www.argentina.gob.ar/servicio/valida-los-documentos-electronicos-firmados-digitalmente) y devuelve
+su JSON: integridad, AC licenciada, vencimientos, revocacion, sello de tiempo, certificado. Es el veredicto
+que vale ante terceros; `/verify` reproduce el mismo criterio en local.
+
+Adobe Acrobat en Mac muestra "validez desconocida" hasta importar las raices como identidades de confianza
+(la raiz argentina no esta en la AATL de Adobe); la opcion "Integracion de Windows" de la guia oficial no
+existe en macOS.
 
 ## Prueba
 

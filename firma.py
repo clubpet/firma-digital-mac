@@ -27,6 +27,7 @@ from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers, validation
 from pyhanko.sign.pkcs11 import PKCS11Signer
 from pyhanko_certvalidator import ValidationContext
+from pyhanko_certvalidator.policy_decl import DisallowWeakAlgorithmsPolicy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRUST_DIR = os.environ.get("FIRMA_TRUST_DIR", os.path.join(HERE, "trust"))
@@ -169,11 +170,17 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, reason=None, location=None, cer
 
 def verify_pdf(pdf_bytes):
     roots = trust_roots()
-    vc = ValidationContext(trust_roots=roots, allow_fetching=True) if roots else ValidationContext(trust_roots=[])
-    r = PdfFileReader(io.BytesIO(pdf_bytes))
+    # Como validadordefirmas.gob.ar: cadena evaluada a la fecha de firma declarada (certs vencidos siguen
+    # valiendo), SHA-1 aceptado (GDE/BORA todavia lo usan), revocacion soft-fail (OCSP de ONTI responde
+    # "unauthorized"; la CRL si anda). strict=False por PDFs hibridos de GDE/BORA.
+    weak = DisallowWeakAlgorithmsPolicy(weak_hash_algos={"md2", "md5"})
+    r = PdfFileReader(io.BytesIO(pdf_bytes), strict=False)
     res = []
     for sig in r.embedded_signatures:
         try:
+            claimed = sig.self_reported_timestamp
+            vc = ValidationContext(trust_roots=roots, allow_fetching=claimed is None, revocation_mode="soft-fail",
+                                   algorithm_usage_policy=weak, **({"moment": claimed} if claimed else {}))
             st = validation.validate_pdf_signature(sig, signer_validation_context=vc)
         except Exception as e:  # firma rota/ilegible: igual la reportamos
             res.append({"campo": sig.field_name, "error": f"{type(e).__name__}: {e}"})
@@ -194,6 +201,7 @@ def verify_pdf(pdf_bytes):
             "motivo_confianza": ("sin raices de confianza (./trust vacio)" if not roots else
                                  "OK" if st.trusted else (str(st.trust_problem_indic) if st.trust_problem_indic else "cadena no valida")),
             "sello_de_tiempo": st.timestamp_validity is not None,
+            "validado_a": "fecha de firma declarada" if claimed else "ahora",
             "resumen": st.summary(),
         })
     return {"firmas": res, "raices_confianza": len(roots)}
