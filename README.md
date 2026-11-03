@@ -38,7 +38,8 @@ FIRMA_PKCS11_LIB=/ruta/al/driver.dylib .venv/bin/python firma.py
 SOFTHSM2_CONF=$PWD/dev/softhsm2.conf FIRMA_PKCS11_LIB=/opt/homebrew/lib/softhsm/libsofthsm2.so .venv/bin/python firma.py
 ```
 
-Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--port N`, `--host`, `-v` (debug).
+Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--trust DIR`, `--port N` (0 = al azar), `--host`, `--token SECRETO`,
+`-v` (debug). La UI web no manda `X-Firma-Token`: con `--token` solo sirve la API.
 
 ## Uso
 
@@ -46,7 +47,7 @@ Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--port N`, `--host`, `-v` (de
   `<nombre>-firmado.pdf` con una firma PAdES visible (recuadro de texto con el CN del firmante y fecha/hora).
   Cada firma agrega un campo `FirmaN`; un PDF ya firmado se puede volver a firmar (revision incremental).
   El PIN se usa solo en esa peticion: no se loguea ni se guarda. Con varios certificados en el token se
-  toma el primero; se puede forzar con el campo `cert_label` del formulario (POST).
+  toma el primero; se elige con `cert_id` (hex, el `id` de `/status`).
 - **Verificar:** PDF → por cada firma: firmante (CN), `serialNumber` del sujeto (en certificados argentinos
   es el `CUIL 20xxxxxxxx5`), emisor, fecha, integridad, si el documento fue modificado despues de firmar,
   si la cadena es confiable (y por que no), y si tiene sello de tiempo.
@@ -59,7 +60,10 @@ Modernizacion-PFDR, Encode, Lakaut, Box Custodia, Digilogix, AFIP, ANSES, etc.),
 oficial `https://pki.jgm.gov.ar/docs/Certificados_AC_Manual.zip`; origen y huellas SHA-256 en `trust/README.md`.
 Con `trust/` presente:
 
-- al firmar se embeben CRL/OCSP de la cadena → **PAdES-B-LT**;
+- al firmar se embeben CRL/OCSP de la cadena → **PAdES-B-LT**. El `ValidationContext` se arma una vez y se
+  reusa entre firmas (cachea la CRL de ONTI, ~9 MB), se pre-carga en segundo plano al arrancar con los certs del
+  token y se rehace cuando una CRL cacheada pasa su `nextUpdate`. Sin red (o cadena no confiable) se firma igual
+  en **PAdES-B-B** y `X-Level` lo dice;
 - al verificar se valida la cadena contra esas raices, con la misma semantica que el validador oficial
   (https://validadordefirmas.gob.ar): cadena evaluada a la fecha de firma declarada, SHA-1 aceptado,
   revocacion soft-fail (el OCSP de ONTI responde `unauthorized`, la CRL diaria si anda).
@@ -84,9 +88,10 @@ existe en macOS.
 .venv/bin/python test_firma.py
 ```
 
-Recrea el token SoftHSM, levanta el server en :8799 con `dev/test-cert.pem` como raiz, prueba PIN
-incorrecto, firma un PDF de 1 pagina (PAdES-B-LT), verifica (integro + cadena confiable + CUIL), altera un
-byte y comprueba que la firma queda invalida.
+Recrea el token SoftHSM con 2 certs (01 autofirmado = raiz; 02 emitido por una CA de prueba con la CRL en un
+puerto cerrado), levanta el backend con `--port 0 --token`, prueba 401, PIN incorrecto, firma B-LT con
+`cert_id=01`, firma B-B con `cert_id=02` (simula sin red), pagina rotada y recortada, verifica, altera un byte y
+llama `/shutdown`. Contra el binario congelado: `FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py`.
 
 ## Limitaciones
 
@@ -94,9 +99,55 @@ byte y comprueba que la firma queda invalida.
   `sign_pdf` si hace falta.
 - El recuadro visible es texto plano (sin imagen/logo), tamano fijo 220x60 pt.
 - Un token a la vez (primer slot con token inicializado); operaciones serializadas con un lock global.
-- Solo probado con SoftHSM2 (RSA-2048/SHA-256). Con el driver real del mToken puede hacer falta
-  `cert_label` si el token trae varios certificados.
-- Sin HTTPS ni autenticacion: pensado para escuchar solo en 127.0.0.1.
+- Firma probada con SoftHSM2 (RSA-2048/SHA-256); con el mToken real se probo `/status` y la pre-carga de CRL.
+- Sin HTTPS: pensado para escuchar solo en 127.0.0.1; `--token` evita que otros procesos locales usen el token.
+
+## Backend congelado (PyInstaller)
+
+```sh
+sh build-backend.sh        # -> dist/firma-backend/ (onedir, arm64, ~48 MB); ejecutable dist/firma-backend/firma-backend
+```
+
+Onedir a proposito: onefile (`ONEFILE=1`) se descomprime en /tmp en cada arranque y macOS re-escanea las
+dylibs, ~16 s por inicio; onedir arranca en ~0.3 s (el primer arranque tras compilar tarda mas por el escaneo
+de Gatekeeper). Copiar el directorio entero (`firma-backend` + `_internal/`). Las raices: `--trust`, si no una
+carpeta `trust/` junto al ejecutable, si no la copia empaquetada en `_internal/trust`.
+
+## API
+
+Contrato estable que usa la app nativa. Todas las respuestas de error de `/sign` son texto plano en castellano;
+las de los demas endpoints, JSON `{"error": "..."}`.
+
+**CLI:** `firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO]`. Al arrancar
+imprime por stdout exactamente una linea `READY port=<n>` (los logs van a stderr). `FIRMA_PKCS11_LIB` y
+`FIRMA_TRUST_DIR` siguen valiendo como default de `--lib`/`--trust`. Con `--token`, todo request sin el header
+`X-Firma-Token: <secreto>` recibe `401`.
+
+- `GET /health` → `{"ok": true, "version": "1.0.0"}`
+- `GET /status` → `{"lib", "lib_found", "trust_roots", "tokens": [{"slot", "label", "serial", "pin_status",
+  "certs": [{"label", "id", "cn", "subject", "valid_until"}]}]}` mas `"error"` si algo falla y `"pkcs11_error"`
+  si la lib existe pero no carga o el token falla. `pin_status`: `ok` | `bajo` (CKF_USER_PIN_COUNT_LOW: hubo
+  intentos fallidos desde el ultimo correcto) | `ultimo_intento` (CKF_USER_PIN_FINAL_TRY) | `bloqueado`.
+- `POST /sign` multipart: `pdf` (archivo), `pin`, `page` (1-based, default 1), `x`, `y`, `w`, `h` (puntos,
+  default 50/50/220/60, admiten decimales), `reason`, `location`, `cert_id` (hex, opcional).
+  - Coordenadas: espacio de usuario por defecto de la pagina, sin rotar, origen abajo-izquierda: el mismo
+    espacio que PDFKit "page space" (`PDFView.convert(_:to: page)`, `PDFAnnotation.bounds`). Se usan tal cual
+    como `/Rect`. Con `/CropBox` distinto del `/MediaBox` las coordenadas son absolutas (no restar el origen del
+    CropBox); la caja tiene que caer dentro del CropBox o es `400`. Con `/Rotate` 90/180/270 el `/Rect` sigue en
+    espacio sin rotar (en una pagina a 90 grados, una caja que en pantalla es ancha tiene `w` chico y `h` grande,
+    que es lo que devuelve PDFKit); el backend contrarrota la apariencia (`/Matrix`) para que el texto se lea
+    derecho en pantalla.
+  - `200`: bytes del PDF; headers `X-Filename` y `X-Signer` (URL-encoded), `X-Level`: `PAdES-B-LT`, o
+    `PAdES-B-B (sin raices de confianza)`, o `PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)`
+    (comparar por prefijo).
+  - Errores: `400` datos invalidos (falta PDF/PIN, pagina inexistente, caja fuera de la pagina, cert_id no hex);
+    `401` falta `X-Firma-Token`; `403` PIN incorrecto o de largo invalido; `404` no hay cert con ese `cert_id`;
+    `409` token no conectado, sin certificados, lib no encontrada o error del token; `423` PIN bloqueado. En `403`/
+    `423` puede venir `X-Pin-Attempts-Left`: `bajo`, `1` (ultimo intento: el proximo error bloquea) o `0`.
+- `POST /verify` multipart `pdf` → `{"firmas": [{campo, firmante, serial_number, emisor, fecha_firma, integra,
+  sin_modificar, cobertura, modificaciones, cadena_confiable, motivo_confianza, sello_de_tiempo, validado_a,
+  resumen} | {campo, error}], "raices_confianza": n}`.
+- `GET` o `POST /shutdown` → `{"ok": true}` y el proceso termina con codigo 0.
 
 ## Distribucion
 

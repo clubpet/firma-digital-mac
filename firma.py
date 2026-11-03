@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Firma Digital (Ley 25.506) de PDFs con token PKCS#11 — app web local minima.
 
-Uso: FIRMA_PKCS11_LIB=/ruta/lib.dylib python3 firma.py [--lib RUTA] [--port 8780]
+Uso: python3 firma.py [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO]
 Raices de confianza opcionales: ./trust/*.pem (si existen, se valida cadena y se embebe CRL/OCSP = PAdES-B-LT).
 """
 import argparse
+import asyncio
+import dataclasses
 import email.parser
 import email.policy
 import glob
+import hmac
 import io
 import json
 import logging
@@ -16,23 +19,30 @@ import sys
 import threading
 import traceback
 import urllib.parse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pkcs11
-from pkcs11 import Attribute, ObjectClass
+from pkcs11 import Attribute, ObjectClass, TokenFlag
 from pyhanko import stamp
 from pyhanko.keys import load_certs_from_pemder
+from pyhanko.pdf_utils import generic, layout, text
+from pyhanko.pdf_utils.font.basic import SimpleFontEngineFactory
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers, validation
 from pyhanko.sign.pkcs11 import PKCS11Signer
-from pyhanko.pdf_utils import text
-from pyhanko.pdf_utils.font.basic import SimpleFontEngineFactory
-from pyhanko_certvalidator import ValidationContext
+from pyhanko_certvalidator import CertificateValidator, ValidationContext
 from pyhanko_certvalidator.policy_decl import DisallowWeakAlgorithmsPolicy
 
+VERSION = "1.0.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
-TRUST_DIR = os.environ.get("FIRMA_TRUST_DIR", os.path.join(HERE, "trust"))
+if getattr(sys, "frozen", False):  # PyInstaller: ./trust junto al ejecutable, si no el empaquetado
+    _side = os.path.join(os.path.dirname(sys.executable), "trust")
+    DEFAULT_TRUST = _side if os.path.isdir(_side) else os.path.join(sys._MEIPASS, "trust")
+else:
+    DEFAULT_TRUST = os.path.join(HERE, "trust")
+TRUST_DIR = os.environ.get("FIRMA_TRUST_DIR", DEFAULT_TRUST)
 # Driver oficial Longmai/Macroseguridad para mToken CryptoID FIPS 140-3 (VID 4C4D PID 8B15).
 # Orden: instalacion por usuario, instalacion del .pkg oficial, SoftHSM de desarrollo.
 CANDIDATE_LIBS = [
@@ -44,7 +54,16 @@ DEFAULT_LIB = next((p for p in CANDIDATE_LIBS if os.path.exists(p)), CANDIDATE_L
 LIB = os.environ.get("FIRMA_PKCS11_LIB", DEFAULT_LIB)
 # ponytail: lock global sobre el token; los tokens USB no toleran sesiones concurrentes.
 TOKEN_LOCK = threading.Lock()
+VC_LOCK = threading.Lock()  # el ValidationContext compartido no es thread-safe
+_VC = None
 log = logging.getLogger("firma")
+
+
+class FirmaError(RuntimeError):
+    """Error con mensaje para el usuario, codigo HTTP y headers extra."""
+    def __init__(self, msg, code=400, headers=()):
+        super().__init__(msg)
+        self.code, self.headers = code, list(headers)
 
 
 # ---------- helpers PKCS#11 / confianza ----------
@@ -56,9 +75,60 @@ def trust_roots():
     return certs
 
 
-def validation_context():
-    roots = trust_roots()
-    return ValidationContext(trust_roots=roots, allow_fetching=True) if roots else None
+def signing_context():
+    """ValidationContext compartido entre firmas: cachea las CRL/OCSP bajadas (la CRL de ONTI pesa ~9 MB).
+    Se rehace si alguna CRL cacheada ya vencio (nextUpdate). Llamar con VC_LOCK."""
+    global _VC
+    now = datetime.now(timezone.utc)
+    if _VC is None or any((c["tbs_cert_list"]["next_update"].native or now) < now for c in _VC.crls):
+        roots = trust_roots()
+        _VC = ValidationContext(trust_roots=roots, allow_fetching=True) if roots else None
+    return _VC
+
+
+def revinfo_ready(vc, cert):
+    """Valida la cadena del firmante con vc (baja y cachea CRL/OCSP). True si hay con que hacer B-LT:
+    cadena confiable y, si el cert publica CRL/OCSP, al menos una respuesta bajada. Llamar con VC_LOCK."""
+    async def run():
+        try:
+            await CertificateValidator(cert, validation_context=vc).async_validate_usage(set())
+        finally:
+            await vc.aclose()
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        log.warning("Sin B-LT para %s: %s", cert_cn(cert), e)
+        return False
+    return not (cert.crl_distribution_points or cert.ocsp_urls) or bool(vc.crls or vc.ocsps)
+
+
+def prewarm():
+    """Al arrancar: baja CRL/OCSP de los certs del token para que la primera firma no espere."""
+    try:
+        with TOKEN_LOCK:
+            certs = [c for t in tokens() for _, _, c in token_certs(t)] if lib_ok() else []
+        with VC_LOCK:
+            vc = signing_context()
+            for c in certs if vc else []:
+                revinfo_ready(vc, c)
+        log.info("Pre-carga de revocacion lista (%d certs)", len(certs))
+    except Exception as e:
+        log.warning("Pre-carga de revocacion fallo: %s", e)
+
+
+def pin_state(token):
+    """Estado del contador de PIN segun los flags del token (CKF_USER_PIN_*)."""
+    f = token.slot.get_token().flags  # releer: los flags cambian tras cada intento
+    if f & TokenFlag.USER_PIN_LOCKED:
+        return "bloqueado"
+    if f & TokenFlag.USER_PIN_FINAL_TRY:
+        return "ultimo_intento"
+    if f & TokenFlag.USER_PIN_COUNT_LOW:
+        return "bajo"
+    return "ok"
+
+
+PIN_HEADER = {"bloqueado": "0", "ultimo_intento": "1", "bajo": "bajo"}
 
 
 def cert_cn(cert):
@@ -88,14 +158,16 @@ def status():
         out["error"] = lib_error()
         return out
     try:
-        for tok in tokens():
-            out["tokens"].append({
-                "slot": tok.slot.slot_id, "label": tok.label.strip(), "serial": tok.serial.decode(errors="replace").strip(),
-                "certs": [{"label": lbl, "id": cid.hex(), "cn": cert_cn(c), "subject": c.subject.human_friendly,
-                           "valid_until": c.not_valid_after.isoformat()} for lbl, cid, c in token_certs(tok)],
-            })
-    except pkcs11.PKCS11Error as e:
-        out["error"] = f"Error PKCS#11: {type(e).__name__} {e}"
+        with TOKEN_LOCK:
+            for tok in tokens():
+                out["tokens"].append({
+                    "slot": tok.slot.slot_id, "label": tok.label.strip(), "serial": tok.serial.decode(errors="replace").strip(),
+                    "pin_status": pin_state(tok),
+                    "certs": [{"label": lbl, "id": cid.hex(), "cn": cert_cn(c), "subject": c.subject.human_friendly,
+                               "valid_until": c.not_valid_after.isoformat()} for lbl, cid, c in token_certs(tok)],
+                })
+    except Exception as e:  # lib que no carga (arquitectura, dependencias) o error del token
+        out["error"] = out["pkcs11_error"] = f"Error PKCS#11: {type(e).__name__} {e}"
     return out
 
 
@@ -115,59 +187,124 @@ def tokens():
 def first_token():
     toks = tokens()
     if not toks:
-        raise RuntimeError("No hay token conectado.")
+        raise FirmaError("Token no conectado.", 409)
     return toks[0]
 
 
-def pick_cert(token, label):
-    """Devuelve (cert_label, cert_id) a usar: por label, o el unico cert, o el primero con clave privada."""
+def pick_cert(token, cert_id=None):
+    """(cert_id, Certificate) a usar: el de cert_id (hex) o el primero del token."""
     certs = token_certs(token)
     if not certs:
-        raise RuntimeError("El token no tiene certificados.")
-    if label:
-        if not any(l == label for l, _, _ in certs):
-            raise RuntimeError(f"No hay certificado con etiqueta '{label}'.")
-        return label, None
-    if len(certs) == 1:
-        return certs[0][0], None
-    return None, certs[0][1]  # ponytail: con varios certs tomamos el primero por ID; pedir label si no sirve
+        raise FirmaError("El token no tiene certificados.", 409)
+    if not cert_id:
+        return certs[0][1], certs[0][2]  # ponytail: con varios certs sin cert_id, el primero
+    try:
+        want = bytes.fromhex(cert_id)
+    except ValueError:
+        raise FirmaError("cert_id invalido: tiene que ser hexadecimal.")
+    for _, cid, c in certs:
+        if cid == want:
+            return cid, c
+    raise FirmaError(f"No hay certificado con id {cert_id} en el token.", 404)
+
+
+@dataclasses.dataclass(frozen=True)
+class RotatedTextStampStyle(stamp.TextStampStyle):
+    """Sello que contrarrota su apariencia segun /Rotate de la pagina para leerse derecho en pantalla."""
+    rotate: int = 0
+
+    def create_stamp(self, writer, box, text_params):
+        if self.rotate in (90, 270):  # en pantalla el recuadro se ve transpuesto
+            box = layout.BoxConstraints(width=box.height, height=box.width)
+        st = super().create_stamp(writer, box, text_params)
+        if self.rotate:
+            mat = {90: (0, 1, -1, 0), 180: (-1, 0, 0, -1), 270: (0, -1, 1, 0)}[self.rotate]
+            orig = st.as_form_xobject
+
+            def as_form_xobject():
+                xo = orig()  # el visor ajusta BBox*Matrix al /Rect (ISO 32000 12.5.5)
+                xo["/Matrix"] = generic.ArrayObject([generic.NumberObject(v) for v in (*mat, 0, 0)])
+                return xo
+            st.as_form_xobject = as_form_xobject
+        return st
+
+
+def page_geometry(reader, page):
+    """(/Rotate efectivo, CropBox) de la pagina (0-based); ambos heredables por el arbol /Pages."""
+    rot = crop = media = None
+    p = reader.find_page_for_modification(page)[0].get_object()
+    while p is not None:
+        rot = p.get("/Rotate") if rot is None else rot
+        crop = p.get("/CropBox") if crop is None else crop
+        media = p.get("/MediaBox") if media is None else media
+        p = p.get("/Parent")
+        p = p.get_object() if p is not None else None
+    box = [float(v) for v in (crop or media)]
+    return int(rot or 0) % 360, (min(box[0], box[2]), min(box[1], box[3]), max(box[0], box[2]), max(box[1], box[3]))
+
+
+def dss_has_revinfo(pdf):
+    dss = PdfFileReader(io.BytesIO(pdf)).root.get("/DSS")
+    dss = dss.get_object() if dss is not None else None
+    return dss is not None and ("/CRLs" in dss or "/OCSPs" in dss)
 
 
 # ---------- firmar / verificar ----------
-def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=None, location=None, cert_label=None):
+def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=None, location=None, cert_id=None):
+    """Firma PAdES visible. Caja (x, y, w, h) en puntos, espacio de usuario de la pagina (sin rotar, origen
+    abajo-izquierda del espacio de la pagina, igual que PDFKit/PDFAnnotation.bounds)."""
     if not lib_ok():
-        raise RuntimeError(lib_error())
+        raise FirmaError(lib_error(), 409)
+    r = PdfFileReader(io.BytesIO(pdf_bytes))
+    n = len(r.embedded_signatures) + 1
+    if not 1 <= page <= r.root["/Pages"]["/Count"]:
+        raise FirmaError(f"La pagina {page} no existe.")
+    rot, (cx1, cy1, cx2, cy2) = page_geometry(r, page - 1)
+    if width <= 0 or height <= 0 or x < cx1 - 1 or y < cy1 - 1 or x + width > cx2 + 1 or y + height > cy2 + 1:
+        raise FirmaError(f"El recuadro de la firma cae fuera de la pagina visible ({cx1:g},{cy1:g})-({cx2:g},{cy2:g}).")
     with TOKEN_LOCK:
-        token = first_token()
-        label, cert_id = pick_cert(token, cert_label)
         try:
-            session = token.open(user_pin=pin)
-        except pkcs11.PinIncorrect:
-            raise RuntimeError("PIN incorrecto.")
-        except pkcs11.PinLocked:
-            raise RuntimeError("PIN bloqueado: demasiados intentos fallidos.")
-        with session:
-            signer = PKCS11Signer(session, cert_id=cert_id, key_id=cert_id)  # en el mToken el label de la clave difiere del cert; coinciden por CKA_ID
-            vc = validation_context()
-            r = PdfFileReader(io.BytesIO(pdf_bytes))
-            n = len(r.embedded_signatures) + 1
-            if not 1 <= page <= r.root["/Pages"]["/Count"]:
-                raise RuntimeError(f"La pagina {page} no existe.")
-            w = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
-            meta = signers.PdfSignatureMetadata(
-                field_name=f"Firma{n}", md_algorithm="sha256", reason=reason or None, location=location or None,
-                subfilter=fields.SigSeedSubFilter.PADES,
-                embed_validation_info=vc is not None, validation_context=vc,
-            )
-            style = stamp.TextStampStyle(
-                stamp_text="Firmado digitalmente por\n%(signer)s\n%(ts)s", border_width=1,
-                timestamp_format="%d/%m/%Y %H:%M:%S %Z",
-                text_box_style=text.TextBoxStyle(font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9),
-            )
-            spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + width, y + height))
-            out = io.BytesIO()
-            signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(w, output=out)
-            return out.getvalue(), ("PAdES-B-LT" if vc else "PAdES-B-B"), cert_cn(signer.signing_cert)
+            token = first_token()
+            cid, cert = pick_cert(token, cert_id)
+            with VC_LOCK:
+                vc = signing_context()
+                lt = vc is not None and revinfo_ready(vc, cert)  # sin red o cadena no confiable: B-B
+                try:
+                    session = token.open(user_pin=pin)
+                except (pkcs11.PinIncorrect, pkcs11.PinLocked) as e:
+                    st = "bloqueado" if isinstance(e, pkcs11.PinLocked) else pin_state(token)
+                    msg = {"bloqueado": "PIN bloqueado: demasiados intentos fallidos. Desbloquealo con el PUK.",
+                           "ultimo_intento": "PIN incorrecto. Queda 1 intento: si vuelve a fallar el token se bloquea.",
+                           "bajo": "PIN incorrecto. Ya hubo intentos fallidos: con 3 seguidos el token se bloquea."}.get(st, "PIN incorrecto.")
+                    hdr = [("X-Pin-Attempts-Left", PIN_HEADER[st])] if st in PIN_HEADER else []
+                    raise FirmaError(msg, 423 if st == "bloqueado" else 403, hdr)
+                except pkcs11.PinLenRange:
+                    raise FirmaError("PIN con largo invalido.", 403)
+                with session:
+                    # en el mToken el label de la clave difiere del cert; coinciden por CKA_ID
+                    signer = PKCS11Signer(session, cert_id=cid, key_id=cid)
+                    meta = signers.PdfSignatureMetadata(
+                        field_name=f"Firma{n}", md_algorithm="sha256", reason=reason or None, location=location or None,
+                        subfilter=fields.SigSeedSubFilter.PADES,
+                        embed_validation_info=lt, validation_context=vc if lt else None,
+                    )
+                    style = RotatedTextStampStyle(
+                        stamp_text="Firmado digitalmente por\n%(signer)s\n%(ts)s", border_width=1,
+                        timestamp_format="%d/%m/%Y %H:%M:%S %Z", rotate=rot,
+                        text_box_style=text.TextBoxStyle(font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9),
+                    )
+                    spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + width, y + height))
+                    out = io.BytesIO()
+                    w = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
+                    signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(w, output=out)
+        except pkcs11.PKCS11Error as e:
+            raise FirmaError(f"Error del token ({type(e).__name__}). Verifica que siga conectado.", 409)
+    signed = out.getvalue()
+    if lt and (cert.crl_distribution_points or cert.ocsp_urls) and not dss_has_revinfo(signed):
+        lt = False
+    level = "PAdES-B-LT" if lt else ("PAdES-B-B (sin raices de confianza)" if vc is None else
+                                     "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)")
+    return signed, level, cert_cn(cert)
 
 
 def verify_pdf(pdf_bytes):
@@ -309,6 +446,8 @@ def parse_multipart(handler):
 
 
 class Handler(BaseHTTPRequestHandler):
+    secret = None  # --token: si esta, cada request debe traer X-Firma-Token
+
     def log_message(self, fmt, *args):  # solo metodo+ruta; nunca cuerpos ni PIN
         log.info("%s %s", self.command, self.path.split("?")[0])
 
@@ -325,69 +464,102 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        if self.secret is None or hmac.compare_digest(self.headers.get("X-Firma-Token", "").encode(), self.secret.encode()):
+            return True
+        self._send(401, "No autorizado.", "text/plain; charset=utf-8")
+        return False
+
+    def _shutdown(self):
+        self._send(200, {"ok": True})
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
     def do_GET(self):
-        if self.path == "/":
+        path = self.path.split("?")[0]
+        if not self._authorized():
+            return
+        if path == "/":
             self._send(200, HTML, "text/html; charset=utf-8")
-        elif self.path == "/status":
+        elif path == "/health":
+            self._send(200, {"ok": True, "version": VERSION})
+        elif path == "/status":
             self._send(200, status())
+        elif path == "/shutdown":
+            self._shutdown()
         else:
             self._send(404, {"error": "no existe"})
 
     def do_POST(self):
+        path = self.path.split("?")[0]
+        if not self._authorized():
+            return
+        if path == "/shutdown":
+            return self._shutdown()
         try:
             form = parse_multipart(self)
             if "pdf" not in form or not isinstance(form["pdf"], tuple) or not form["pdf"][1]:
-                raise RuntimeError("Falta el PDF.")
+                raise FirmaError("Falta el PDF.")
             fn, pdf = form["pdf"]
-            if self.path == "/sign":
+            if path == "/sign":
                 pin = form.get("pin", "")
                 if not pin:
-                    raise RuntimeError("Falta el PIN.")
+                    raise FirmaError("Falta el PIN.")
+                try:
+                    num = {k: float(form.get(k) or d) for k, d in (("x", 50), ("y", 50), ("w", 220), ("h", 60))}
+                    page = int(form.get("page") or 1)
+                except ValueError:
+                    raise FirmaError("page/x/y/w/h tienen que ser numeros.")
                 signed, level, cn = sign_pdf(
-                    pdf, pin, page=int(form.get("page") or 1), x=int(form.get("x") or 50), y=int(form.get("y") or 50),
-                    width=int(form.get("w") or 220), height=int(form.get("h") or 60),
-                    reason=form.get("reason"), location=form.get("location"), cert_label=form.get("cert_label") or None)
+                    pdf, pin, page=page, x=num["x"], y=num["y"], width=num["w"], height=num["h"],
+                    reason=form.get("reason"), location=form.get("location"), cert_id=form.get("cert_id") or None)
                 del pin, form
                 out = (os.path.splitext(fn or "documento")[0]) + "-firmado.pdf"
                 q = urllib.parse.quote(out)
                 self._send(200, signed, "application/pdf", [
                     ("Content-Disposition", f"attachment; filename*=UTF-8''{q}"),
                     ("X-Filename", q), ("X-Level", level), ("X-Signer", urllib.parse.quote(cn))])
-            elif self.path == "/verify":
+            elif path == "/verify":
                 self._send(200, verify_pdf(pdf))
             else:
                 self._send(404, {"error": "no existe"})
         except Exception as e:
             log.debug(traceback.format_exc())
             msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
-            if self.path == "/sign":
-                self._send(400, msg, "text/plain; charset=utf-8")
+            code, hdrs = (e.code, e.headers) if isinstance(e, FirmaError) else (400, [])
+            if path == "/sign":
+                self._send(code, msg, "text/plain; charset=utf-8", hdrs)
             else:
-                self._send(400, {"error": msg})
+                self._send(code, {"error": msg}, headers=hdrs)
 
 
 def main():
-    global LIB
+    global LIB, TRUST_DIR
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o SoftHSM)")
+    ap.add_argument("--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o autodeteccion)")
+    ap.add_argument("--trust", default=TRUST_DIR, help="carpeta de raices de confianza (default: env FIRMA_TRUST_DIR o ./trust)")
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8780)
+    ap.add_argument("--port", type=int, default=8780, help="0 = puerto libre al azar")
+    ap.add_argument("--token", default=None, help="secreto exigido en el header X-Firma-Token")
     ap.add_argument("-v", action="store_true", help="log debug")
     a = ap.parse_args()
-    LIB = a.lib
-    logging.basicConfig(level=logging.DEBUG if a.v else logging.INFO, format="%(asctime)s %(message)s")
+    LIB, TRUST_DIR, Handler.secret = a.lib, a.trust, a.token
+    logging.basicConfig(level=logging.DEBUG if a.v else logging.INFO, format="%(asctime)s %(message)s")  # stderr
     if not a.v:  # pyHanko loguea tracebacks completos por cada cadena no confiable
         for name in ("pyhanko", "pyhanko_certvalidator"):
             logging.getLogger(name).setLevel(logging.CRITICAL)
     if not lib_ok():
         log.warning(lib_error())
-    log.info("Raices de confianza en %s: %d (%s)", TRUST_DIR, len(trust_roots()), "PAdES-B-LT" if trust_roots() else "PAdES-B-B")
+    n = len(trust_roots())
+    log.info("Raices de confianza en %s: %d (%s)", TRUST_DIR, n, "PAdES-B-LT" if n else "PAdES-B-B")
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, a.port, LIB)
+    log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, srv.server_address[1], LIB)
+    print(f"READY port={srv.server_address[1]}", flush=True)  # la app parsea esta linea
+    threading.Thread(target=prewarm, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    srv.server_close()
 
 
 if __name__ == "__main__":
