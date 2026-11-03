@@ -32,6 +32,7 @@ from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers, validation
 from pyhanko.sign.pkcs11 import PKCS11Signer
+from pyhanko.sign.timestamps import HTTPTimeStamper
 from pyhanko_certvalidator import CertificateValidator, ValidationContext
 from pyhanko_certvalidator.policy_decl import DisallowWeakAlgorithmsPolicy
 
@@ -44,6 +45,12 @@ else:
     DEFAULT_TRUST = os.path.join(HERE, "trust")
 TRUST_DIR = os.environ.get("FIRMA_TRUST_DIR", DEFAULT_TRUST)
 LT = os.environ.get("FIRMA_LT") == "1"  # B-LT opcional: embeber la CRL de ONTI suma ~9 MB a cada PDF
+# Sello de tiempo RFC 3161. Default: TSA publica en el host de Encode; los tokens los firma
+# "Servicio de Sellado de Tiempo de JGM", emitido por AC ONTI (ya esta en ./trust). "none" = sin sello.
+DEFAULT_TSA = "https://tsa.encodesa.com.ar/tsa"
+TSA = os.environ.get("FIRMA_TSA", DEFAULT_TSA)
+TSA = None if TSA.lower() in ("", "none") else TSA
+TSA_TIMEOUT = 8
 # Driver oficial Longmai/Macroseguridad para mToken CryptoID FIPS 140-3 (VID 4C4D PID 8B15).
 # Orden: instalacion por usuario, instalacion del .pkg oficial, SoftHSM de desarrollo.
 CANDIDATE_LIBS = [
@@ -68,10 +75,11 @@ class FirmaError(RuntimeError):
 
 
 # ---------- helpers PKCS#11 / confianza ----------
-def trust_roots():
-    """Certs PEM/DER en ./trust. Vacio si la carpeta no existe."""
+def trust_roots(sub=""):
+    """Certs PEM/DER en ./trust (o ./trust/<sub>). Vacio si la carpeta no existe."""
     certs = []
-    for f in sorted(glob.glob(os.path.join(TRUST_DIR, "*.pem")) + glob.glob(os.path.join(TRUST_DIR, "*.crt"))):
+    d = os.path.join(TRUST_DIR, sub)
+    for f in sorted(glob.glob(os.path.join(d, "*.pem")) + glob.glob(os.path.join(d, "*.crt"))):
         certs.extend(load_certs_from_pemder([f]))
     return certs
 
@@ -117,6 +125,18 @@ def prewarm():
         log.warning("Pre-carga de revocacion fallo: %s", e)
 
 
+_TS = None
+
+
+def timestamper():
+    """HTTPTimeStamper reusado: cachea la respuesta de prueba que pyHanko pide para reservar espacio,
+    asi cada firma hace un solo pedido a la TSA. Llamar con TOKEN_LOCK."""
+    global _TS
+    if TSA and (_TS is None or _TS.url != TSA):
+        _TS = HTTPTimeStamper(TSA, timeout=TSA_TIMEOUT)
+    return _TS if TSA else None
+
+
 def pin_state(token):
     """Estado del contador de PIN segun los flags del token (CKF_USER_PIN_*)."""
     f = token.slot.get_token().flags  # releer: los flags cambian tras cada intento
@@ -154,7 +174,7 @@ def token_certs(token):
 
 
 def status():
-    out = {"lib": LIB, "lib_found": lib_ok(), "trust_roots": len(trust_roots()), "lt": LT, "tokens": []}
+    out = {"lib": LIB, "lib_found": lib_ok(), "trust_roots": len(trust_roots()), "lt": LT, "tsa": TSA, "tokens": []}
     if not out["lib_found"]:
         out["error"] = lib_error()
         return out
@@ -295,21 +315,40 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=No
                         text_box_style=text.TextBoxStyle(font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9),
                     )
                     spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + width, y + height))
-                    out = io.BytesIO()
-                    w = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
-                    signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(w, output=out)
+
+                    def do_sign(ts):
+                        out = io.BytesIO()
+                        signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec, timestamper=ts
+                                          ).sign_pdf(IncrementalPdfFileWriter(io.BytesIO(pdf_bytes)), output=out)
+                        return out.getvalue()
+                    ts_err = None
+                    try:
+                        signed = do_sign(timestamper())
+                    except pkcs11.PKCS11Error:
+                        raise
+                    except Exception as e:  # TSA caida o lenta: se firma igual, sin sello, y se avisa
+                        if not TSA:
+                            raise
+                        ts_err = f"{type(e).__name__}: {e}"[:150].encode("ascii", "replace").decode()
+                        log.warning("Sin sello de tiempo (%s): %s", TSA, ts_err)
+                        signed = do_sign(None)
         except pkcs11.PKCS11Error as e:
             raise FirmaError(f"Error del token ({type(e).__name__}). Verifica que siga conectado.", 409)
-    signed = out.getvalue()
     if lt and (cert.crl_distribution_points or cert.ocsp_urls) and not dss_has_revinfo(signed):
         lt = False
-    level = ("PAdES-B-LT" if lt else "PAdES-B-B" if not LT else "PAdES-B-B (sin raices de confianza)" if vc is None
-             else "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)")
+    if ts_err:
+        level = f"PAdES-B-B (sin sello de tiempo: {ts_err})"
+    elif LT and not lt:
+        level = ("PAdES-B-B (sin raices de confianza)" if vc is None else
+                 "PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)") + (" con sello de tiempo" if TSA else "")
+    else:
+        level = "PAdES-B-LT" if lt else "PAdES-B-T" if TSA else "PAdES-B-B"
     return signed, level, cert_cn(cert)
 
 
 def verify_pdf(pdf_bytes):
     roots = trust_roots()
+    ts_roots = roots + trust_roots("tsa")  # raices extra solo para sellos de tiempo (TSA extranjera)
     # Como validadordefirmas.gob.ar: cadena evaluada a la fecha de firma declarada (certs vencidos siguen
     # valiendo), SHA-1 aceptado (GDE/BORA todavia lo usan), revocacion soft-fail (OCSP de ONTI responde
     # "unauthorized"; la CRL si anda). strict=False por PDFs hibridos de GDE/BORA.
@@ -319,9 +358,10 @@ def verify_pdf(pdf_bytes):
     for sig in r.embedded_signatures:
         try:
             claimed = sig.self_reported_timestamp
-            vc = ValidationContext(trust_roots=roots, allow_fetching=claimed is None, revocation_mode="soft-fail",
-                                   algorithm_usage_policy=weak, **({"moment": claimed} if claimed else {}))
-            st = validation.validate_pdf_signature(sig, signer_validation_context=vc)
+            kw = dict(allow_fetching=claimed is None, revocation_mode="soft-fail", algorithm_usage_policy=weak,
+                      **({"moment": claimed} if claimed else {}))
+            st = validation.validate_pdf_signature(sig, signer_validation_context=ValidationContext(trust_roots=roots, **kw),
+                                                   ts_validation_context=ValidationContext(trust_roots=ts_roots, **kw))
         except Exception as e:  # firma rota/ilegible: igual la reportamos
             res.append({"campo": sig.field_name, "error": f"{type(e).__name__}: {e}"})
             continue
@@ -340,7 +380,10 @@ def verify_pdf(pdf_bytes):
             "cadena_confiable": bool(st.trusted),
             "motivo_confianza": ("sin raices de confianza (./trust vacio)" if not roots else
                                  "OK" if st.trusted else (str(st.trust_problem_indic) if st.trust_problem_indic else "cadena no valida")),
-            "sello_de_tiempo": st.timestamp_validity is not None,
+            "sello_de_tiempo": (tv := st.timestamp_validity) is not None,
+            "sello_de_tiempo_confiable": bool(tv and tv.trusted),
+            "sello_de_tiempo_fecha": tv.timestamp.isoformat() if tv else None,
+            "sello_de_tiempo_emisor": tv.signing_cert.subject.native.get("common_name", "") if tv else None,
             "validado_a": "fecha de firma declarada" if claimed else "ahora",
             "resumen": st.summary(),
         })
@@ -534,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global LIB, TRUST_DIR, LT
+    global LIB, TRUST_DIR, LT, TSA
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--lib", default=LIB, help="ruta a la libreria PKCS#11 (default: env FIRMA_PKCS11_LIB o autodeteccion)")
     ap.add_argument("--trust", default=TRUST_DIR, help="carpeta de raices de confianza (default: env FIRMA_TRUST_DIR o ./trust)")
@@ -542,9 +585,11 @@ def main():
     ap.add_argument("--port", type=int, default=8780, help="0 = puerto libre al azar")
     ap.add_argument("--token", default=None, help="secreto exigido en el header X-Firma-Token")
     ap.add_argument("--lt", action="store_true", default=LT, help="firmar PAdES-B-LT (embebe CRL/OCSP, ~9 MB con ONTI)")
+    ap.add_argument("--tsa", default=TSA or "none", help=f"URL de la TSA RFC 3161 (default: env FIRMA_TSA o {DEFAULT_TSA}); none = sin sello")
     ap.add_argument("-v", action="store_true", help="log debug")
     a = ap.parse_args()
     LIB, TRUST_DIR, LT, Handler.secret = a.lib, a.trust, a.lt, a.token
+    TSA = None if a.tsa.lower() in ("", "none") else a.tsa
     logging.basicConfig(level=logging.DEBUG if a.v else logging.INFO, format="%(asctime)s %(message)s")  # stderr
     if not a.v:  # pyHanko loguea tracebacks completos por cada cadena no confiable
         for name in ("pyhanko", "pyhanko_certvalidator"):
@@ -552,7 +597,7 @@ def main():
     if not lib_ok():
         log.warning(lib_error())
     n = len(trust_roots())
-    log.info("Raices de confianza en %s: %d; firma %s", TRUST_DIR, n, "PAdES-B-LT" if LT and n else "PAdES-B-B")
+    log.info("Raices de confianza en %s: %d; firma %s; TSA %s", TRUST_DIR, n, "PAdES-B-LT" if LT and n else "PAdES-B-B", TSA)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     log.info("Escuchando en http://%s:%d  (lib: %s)", a.host, srv.server_address[1], LIB)
     print(f"READY port={srv.server_address[1]}", flush=True)  # la app parsea esta linea

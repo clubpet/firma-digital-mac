@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Prueba punta a punta contra SoftHSM2: crea token (2 certs), levanta el backend (B-B y --lt), firma, verifica, altera.
+"""Prueba punta a punta contra SoftHSM2: crea token (2 certs) y una TSA local de prueba, levanta el backend
+(B-T, --lt, --tsa none, TSA caida), firma, verifica, altera. Sin red salvo el chequeo opcional contra la TSA real.
 Uso: .venv/bin/python test_firma.py                         (firma.py)
      FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py   (binario congelado)
 """
@@ -13,7 +14,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.environ.get("FIRMA_PKCS11_LIB", "/opt/homebrew/lib/softhsm/libsofthsm2.so")
@@ -72,8 +75,9 @@ def widget(pdf):
     return [float(v) for v in f["/Rect"]], f["/AP"]["/N"].get_object()
 
 
-def add_ca_cert(trust):
-    """Segundo cert (id 02) emitido por una CA de prueba, con CRL en un puerto cerrado: simula estar sin red."""
+def add_ca_cert(trust, tsa_dir):
+    """Segundo cert (id 02) emitido por una CA de prueba, con CRL en un puerto cerrado: simula estar sin red.
+    Tambien un cert de TSA emitido por la misma CA (tsa_dir/tsa.pem + tsa.key)."""
     d = tempfile.mkdtemp()
     run = lambda *a: subprocess.run(a, check=True, capture_output=True, cwd=d)
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-keyout", "ca.key", "-out", "ca.pem",
@@ -88,8 +92,38 @@ def add_ca_cert(trust):
     run("softhsm2-util", "--import", "k.pem", "--token", "FirmaDev", "--pin", "1234", "--label", "firma2", "--id", "02")
     run("pkcs11-tool", "--module", LIB, "--token-label", "FirmaDev", "--login", "--pin", "1234",
         "--write-object", "c.der", "--type", "cert", "--label", "firma2", "--id", "02")
+    open(os.path.join(d, "tsa.cnf"), "w").write("extendedKeyUsage=critical,timeStamping\nkeyUsage=critical,digitalSignature\n")
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", os.path.join(tsa_dir, "tsa.key"), "-out", "t.csr",
+        "-subj", "/C=AR/O=Prueba/CN=TSA Prueba")
+    run("openssl", "x509", "-req", "-in", "t.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "3650",
+        "-sha256", "-extfile", "tsa.cnf", "-out", os.path.join(tsa_dir, "tsa.pem"))
     shutil.copy(os.path.join(d, "ca.pem"), os.path.join(trust, "ca.pem"))
     shutil.rmtree(d)
+
+
+def mock_tsa(tsa_dir):
+    """TSA RFC 3161 local (DummyTimeStamper de pyHanko detras de http.server). Devuelve la URL."""
+    from asn1crypto import tsp
+    from pyhanko.keys import load_cert_from_pemder, load_private_key_from_pemder
+    from pyhanko.sign.timestamps import DummyTimeStamper
+    ts = DummyTimeStamper(load_cert_from_pemder(os.path.join(tsa_dir, "tsa.pem")),
+                          load_private_key_from_pemder(os.path.join(tsa_dir, "tsa.key"), None))
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            req = tsp.TimeStampReq.load(self.rfile.read(int(self.headers["Content-Length"])))
+            body = ts.request_tsa_response(req).dump()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/timestamp-reply")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}/tsa"
 
 
 def start(trust, *extra):
@@ -119,8 +153,10 @@ def main():
     os.environ["SOFTHSM2_CONF"] = os.path.join(HERE, "dev", "softhsm2.conf")
     trust = tempfile.mkdtemp()
     shutil.copy(os.path.join(HERE, "dev", "test-cert.pem"), trust)  # cert autofirmado 01 = raiz
-    add_ca_cert(trust)
-    srv = start(trust)
+    tsa_dir = tempfile.mkdtemp()
+    add_ca_cert(trust, tsa_dir)
+    tsa = mock_tsa(tsa_dir)
+    srv = start(trust, "--tsa", tsa)
     try:
 
         assert req("/health", token=None)[0] == 401 and req("/health", token="otro")[0] == 401
@@ -147,7 +183,7 @@ def main():
             times.append(time.time() - t)
             assert code == 200, signed.decode()
         print("firmado:", h["X-Level"], h["X-Filename"], len(signed), "bytes; tiempos", [round(x, 3) for x in times])
-        assert h["X-Filename"] == "contrato-firmado.pdf" and h["X-Level"] == "PAdES-B-B" and not has_dss(signed)
+        assert h["X-Filename"] == "contrato-firmado.pdf" and h["X-Level"] == "PAdES-B-T" and not has_dss(signed)
         assert widget(signed)[0] == [50.5, 60, 250.5, 110]
 
         code, body, _ = req("/verify", {"pdf": ("x.pdf", signed)})
@@ -157,11 +193,12 @@ def main():
         f = v[0]
         assert f["firmante"] == "Juan Perez" and f["serial_number"] == "CUIL 20123456785"
         assert f["integra"] and f["sin_modificar"] and f["cadena_confiable"], f
+        assert f["sello_de_tiempo"] and f["sello_de_tiempo_confiable"] and f["sello_de_tiempo_emisor"] == "TSA Prueba", f
 
         # segunda firma con cert 02 elegido por cert_id
         code, signed2, h = req("/sign", {"pdf": ("c.pdf", signed), "pin": "1234", "cert_id": "02", "x": "300", "y": "60"})
         assert code == 200, signed2.decode()
-        assert h["X-Level"] == "PAdES-B-B" and h["X-Signer"] == "Ana%20Gomez", h
+        assert h["X-Level"] == "PAdES-B-T" and h["X-Signer"] == "Ana%20Gomez", h
         v = json.loads(req("/verify", {"pdf": ("x.pdf", signed2)})[1])["firmas"]
         assert [x["firmante"] for x in v] == ["Juan Perez", "Ana Gomez"] and all(x["integra"] for x in v), v
         assert req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234", "cert_id": "ff"})[0] == 404
@@ -194,7 +231,7 @@ def main():
         stop(srv)
 
         # --lt: cert 01 (autofirmado = raiz, sin CRL que bajar) -> B-LT; cert 02 con CRL caida -> B-B y lo dice
-        srv = start(trust, "--lt")
+        srv = start(trust, "--lt", "--tsa", tsa)
         assert json.loads(req("/status")[1])["lt"] is True
         code, s, h = req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234", "cert_id": "01"})
         assert code == 200 and h["X-Level"] == "PAdES-B-LT" and has_dss(s), h
@@ -202,12 +239,33 @@ def main():
         print("--lt cert 02:", h["X-Level"])
         assert code == 200 and h["X-Level"].startswith("PAdES-B-B") and "sin CRL" in h["X-Level"], h
         stop(srv)
-        print("OK: B-B default + cert_id + --lt (B-LT y B-B sin red) + rotada/recortada + verificacion + alteracion + shutdown")
+
+        # --tsa none -> B-B; TSA caida -> firma igual sin sello y lo dice
+        for args, want in ((["--tsa", "none"], "PAdES-B-B"), (["--tsa", "http://127.0.0.1:9/tsa"], "PAdES-B-B (sin sello de tiempo:")):
+            srv = start(trust, *args)
+            code, s, h = req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234"})
+            print(args[1], "->", h.get("X-Level"))
+            assert code == 200 and h["X-Level"].startswith(want), h
+            assert not json.loads(req("/verify", {"pdf": ("x.pdf", s)})[1])["firmas"][0]["sello_de_tiempo"]
+            stop(srv)
+
+        # TSA real por defecto (JGM via Encode); se saltea si no hay red
+        srv = start(trust)
+        code, s, h = req("/sign", {"pdf": ("c.pdf", pdf), "pin": "1234"})
+        if h.get("X-Level") == "PAdES-B-T":
+            f = json.loads(req("/verify", {"pdf": ("x.pdf", s)})[1])["firmas"][0]
+            print("TSA real:", f["sello_de_tiempo_emisor"], f["sello_de_tiempo_fecha"])
+            assert f["sello_de_tiempo"] and f["sello_de_tiempo_emisor"] == "Servicio de Sellado de Tiempo de JGM", f
+        else:
+            print("TSA real no disponible, salteado:", h.get("X-Level"))
+        stop(srv)
+        print("OK: B-T + cert_id + --lt + --tsa none + TSA caida + rotada/recortada + verificacion + alteracion + shutdown")
     finally:
         if srv.poll() is None:
             srv.terminate()
             srv.wait()
         shutil.rmtree(trust, ignore_errors=True)
+        shutil.rmtree(tsa_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

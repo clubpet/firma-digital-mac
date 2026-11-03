@@ -38,13 +38,13 @@ FIRMA_PKCS11_LIB=/ruta/al/driver.dylib .venv/bin/python firma.py
 SOFTHSM2_CONF=$PWD/dev/softhsm2.conf FIRMA_PKCS11_LIB=/opt/homebrew/lib/softhsm/libsofthsm2.so .venv/bin/python firma.py
 ```
 
-Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--trust DIR`, `--port N` (0 = al azar), `--host`, `--token SECRETO`, `--lt`,
+Abrir http://127.0.0.1:8780. Flags: `--lib RUTA`, `--trust DIR`, `--port N` (0 = al azar), `--host`, `--token SECRETO`, `--lt`, `--tsa URL|none`,
 `-v` (debug). La UI web no manda `X-Firma-Token`: con `--token` solo sirve la API.
 
 ## Uso
 
 - **Firmar:** PDF + PIN (+ pagina, posicion X/Y en puntos desde abajo-izquierda, motivo, lugar). Devuelve
-  `<nombre>-firmado.pdf` con una firma PAdES-B-B visible (recuadro de texto con el CN del firmante y fecha/hora).
+  `<nombre>-firmado.pdf` con una firma PAdES-B-T (con sello de tiempo) visible (recuadro de texto con el CN del firmante y fecha/hora).
   Cada firma agrega un campo `FirmaN`; un PDF ya firmado se puede volver a firmar (revision incremental).
   El PIN se usa solo en esa peticion: no se loguea ni se guarda. Con varios certificados en el token se
   toma el primero; se elige con `cert_id` (hex, el `id` de `/status`).
@@ -73,6 +73,32 @@ Con `trust/` presente:
 Sin `trust/` la verificacion reporta "sin raices de confianza".
 `FIRMA_TRUST_DIR` cambia la carpeta (lo usa el test).
 
+## Sello de tiempo (RFC 3161)
+
+Cada firma lleva por defecto un sello de tiempo de **`https://tsa.encodesa.com.ar/tsa`**: el host es de Encode
+(AC licenciada) y los tokens los firma **"Servicio de Sellado de Tiempo de JGM"**, emitido por **AC ONTI**
+("Autoridad Certificante de Firma Digital", ya en `trust/`), asi que `/verify` lo da por confiable sin agregar
+nada. Sin sello, validadordefirmas.gob.ar avisa "La hora de la firma procede del reloj del equipo del firmante".
+Suma ~9 KB al PDF y ~0,5 s por firma (~1,2 s la primera: pyHanko pide un sello de prueba para reservar lugar; se
+reusa el cliente para que no se repita). Si la TSA no responde (timeout 8 s) se firma igual, sin sello, y
+`X-Level` lo dice. `--tsa URL` (o `FIRMA_TSA`) cambia la TSA, `--tsa none` la apaga.
+
+Relevamiento 2026-11-03 (POST de un `TimeStampReq` a cada URL):
+
+| TSA | Resultado |
+|---|---|
+| `https://tsa.encodesa.com.ar/tsa` | OK, emisor JGM / AC ONTI (politica OID `2.3.4.5`) |
+| `tsa.firmar.gob.ar`, `tsa.jgm.gov.ar`, `tsa.lakaut.com.ar`, `tsa.digilogix.com.ar` | no resuelven (DNS) |
+| `tsa.pki.gob.ar` (IIS de ONTI) | existe, 404 en todas las rutas probadas |
+| `tst.firmar.gob.ar` | testing de la Plataforma de Firma Digital Remota, no es TSA |
+| `tsa.boxcustodia.com` | sitio web, no TSA |
+| `timestamp.digicert.com`, `timestamp.sectigo.com`, `ts.ssl.com`, `freetsa.org/tsr` | OK, extranjeras |
+
+validadordefirmas.gob.ar muestra `tsaInfo` (`subjectCN`, `issuerCN`, `valid`, `containsTsa`) y acepta como
+`valid: true` tanto la TSA de JGM como DigiCert: no informa si la TSA es licenciada. Para usar una TSA extranjera
+y que `/verify` diga `sello_de_tiempo_confiable: true`, poner su raiz en `trust/tsa/*.pem` (solo se usa para
+validar sellos de tiempo, no firmas).
+
 ## Validador oficial
 
 `python3 validador_oficial.py doc.pdf` sube el PDF a validadordefirmas.gob.ar (la API de la pagina
@@ -91,14 +117,14 @@ existe en macOS.
 ```
 
 Recrea el token SoftHSM con 2 certs (01 autofirmado = raiz; 02 emitido por una CA de prueba con la CRL en un
-puerto cerrado), levanta el backend con `--port 0 --token`, prueba 401, PIN incorrecto, firma B-B (default) con
-`cert_id` 01 y 02, pagina rotada y recortada, verifica, altera un byte y llama `/shutdown`; despues lo levanta con
-`--lt`: B-LT con 01 y fallback a B-B con 02 (CRL caida, simula sin red). Contra el binario congelado: `FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py`.
+puerto cerrado) y una TSA local de prueba (DummyTimeStamper de pyHanko), levanta el backend con `--port 0 --token`,
+prueba 401, PIN incorrecto, firma B-T con `cert_id` 01 y 02, pagina rotada y recortada, verifica (sello confiable),
+altera un byte y llama `/shutdown`; despues `--lt` (B-LT con 01, fallback a B-B con 02), `--tsa none` (B-B), TSA
+caida (B-B "sin sello de tiempo") y, si hay red, la TSA real por defecto. Contra el binario congelado: `FIRMA_BACKEND=dist/firma-backend/firma-backend .venv/bin/python test_firma.py`.
 
 ## Limitaciones
 
-- Sin sello de tiempo (PAdES-B-T/LTA): se necesita una TSA; agregar `timestamper=HTTPTimeStamper(url)` en
-  `sign_pdf` si hace falta.
+- Sin PAdES-B-LTA (sello de documento para archivo a largo plazo).
 - El recuadro visible es texto plano (sin imagen/logo), tamano fijo 220x60 pt.
 - Un token a la vez (primer slot con token inicializado); operaciones serializadas con un lock global.
 - Firma probada con SoftHSM2 (RSA-2048/SHA-256); con el mToken real se probo `/status` y la pre-carga de CRL.
@@ -120,14 +146,15 @@ carpeta `trust/` junto al ejecutable, si no la copia empaquetada en `_internal/t
 Contrato estable que usa la app nativa. Todas las respuestas de error de `/sign` son texto plano en castellano;
 las de los demas endpoints, JSON `{"error": "..."}`.
 
-**CLI:** `firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO] [--lt]`. Al
+**CLI:** `firma-backend [--port N] [--host 127.0.0.1] [--lib RUTA] [--trust DIR] [--token SECRETO] [--lt] [--tsa URL|none]`. Al
 arrancar imprime por stdout exactamente una linea `READY port=<n>` (los logs van a stderr). `FIRMA_PKCS11_LIB`,
-`FIRMA_TRUST_DIR` y `FIRMA_LT=1` valen como default de `--lib`/`--trust`/`--lt`. Sin `--lt` el backend queda
+`FIRMA_TRUST_DIR`, `FIRMA_LT=1` y `FIRMA_TSA` valen como default de `--lib`/`--trust`/`--lt`/`--tsa`
+(default TSA `https://tsa.encodesa.com.ar/tsa`). Sin `--lt` el backend queda
 ocioso al arrancar (no baja nada). Con `--token`, todo request sin el header
 `X-Firma-Token: <secreto>` recibe `401`.
 
 - `GET /health` → `{"ok": true, "version": "1.0.0"}`
-- `GET /status` → `{"lib", "lib_found", "trust_roots", "lt", "tokens": [{"slot", "label", "serial", "pin_status",
+- `GET /status` → `{"lib", "lib_found", "trust_roots", "lt", "tsa" (URL o null), "tokens": [{"slot", "label", "serial", "pin_status",
   "certs": [{"label", "id", "cn", "subject", "valid_until"}]}]}` mas `"error"` si algo falla y `"pkcs11_error"`
   si la lib existe pero no carga o el token falla. `pin_status`: `ok` | `bajo` (CKF_USER_PIN_COUNT_LOW: hubo
   intentos fallidos desde el ultimo correcto) | `ultimo_intento` (CKF_USER_PIN_FINAL_TRY) | `bloqueado`.
@@ -140,16 +167,17 @@ ocioso al arrancar (no baja nada). Con `--token`, todo request sin el header
     espacio sin rotar (en una pagina a 90 grados, una caja que en pantalla es ancha tiene `w` chico y `h` grande,
     que es lo que devuelve PDFKit); el backend contrarrota la apariencia (`/Matrix`) para que el texto se lea
     derecho en pantalla.
-  - `200`: bytes del PDF; headers `X-Filename` y `X-Signer` (URL-encoded), `X-Level`: `PAdES-B-B` (default). Solo
-    con `--lt`: `PAdES-B-LT`, o `PAdES-B-B (sin raices de confianza)`, o `PAdES-B-B (sin CRL/OCSP: sin conexion o
-    cadena no confiable)` (comparar por prefijo).
+  - `200`: bytes del PDF; headers `X-Filename` y `X-Signer` (URL-encoded), `X-Level` (comparar por prefijo):
+    `PAdES-B-T` (default, con sello de tiempo); `PAdES-B-B` (`--tsa none`); `PAdES-B-B (sin sello de tiempo:
+    <motivo>)` (TSA caida, la firma vale igual). Con `--lt`: `PAdES-B-LT`, o `PAdES-B-B (sin raices de confianza)`
+    / `PAdES-B-B (sin CRL/OCSP: sin conexion o cadena no confiable)`, seguidos de ` con sello de tiempo` si lo hubo.
   - Errores: `400` datos invalidos (falta PDF/PIN, pagina inexistente, caja fuera de la pagina, cert_id no hex);
     `401` falta `X-Firma-Token`; `403` PIN incorrecto o de largo invalido; `404` no hay cert con ese `cert_id`;
     `409` token no conectado, sin certificados, lib no encontrada o error del token; `423` PIN bloqueado. En `403`/
     `423` puede venir `X-Pin-Attempts-Left`: `bajo`, `1` (ultimo intento: el proximo error bloquea) o `0`.
 - `POST /verify` multipart `pdf` → `{"firmas": [{campo, firmante, serial_number, emisor, fecha_firma, integra,
-  sin_modificar, cobertura, modificaciones, cadena_confiable, motivo_confianza, sello_de_tiempo, validado_a,
-  resumen} | {campo, error}], "raices_confianza": n}`.
+  sin_modificar, cobertura, modificaciones, cadena_confiable, motivo_confianza, sello_de_tiempo, sello_de_tiempo_confiable,
+  sello_de_tiempo_fecha (ISO, hora de la TSA), sello_de_tiempo_emisor (CN de la TSA), validado_a, resumen} | {campo, error}], "raices_confianza": n}`.
 - `GET` o `POST /shutdown` → `{"ok": true}` y el proceso termina con codigo 0.
 
 ## Distribucion
