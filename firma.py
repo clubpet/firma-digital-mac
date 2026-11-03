@@ -134,7 +134,7 @@ def pick_cert(token, label):
 
 
 # ---------- firmar / verificar ----------
-def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, w=220, h=60, reason=None, location=None, cert_label=None):
+def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, width=220, height=60, reason=None, location=None, cert_label=None):
     if not lib_ok():
         raise RuntimeError(lib_error())
     with TOKEN_LOCK:
@@ -164,7 +164,7 @@ def sign_pdf(pdf_bytes, pin, page=1, x=50, y=50, w=220, h=60, reason=None, locat
                 timestamp_format="%d/%m/%Y %H:%M:%S %Z",
                 text_box_style=text.TextBoxStyle(font=SimpleFontEngineFactory("Helvetica", avg_width=0.5), font_size=9),
             )
-            spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + w, y + h))
+            spec = fields.SigFieldSpec(f"Firma{n}", on_page=page - 1, box=(x, y, x + width, y + height))
             out = io.BytesIO()
             signers.PdfSigner(meta, signer=signer, stamp_style=style, new_field_spec=spec).sign_pdf(w, output=out)
             return out.getvalue(), ("PAdES-B-LT" if vc else "PAdES-B-B"), cert_cn(signer.signing_cert)
@@ -345,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError("Falta el PIN.")
                 signed, level, cn = sign_pdf(
                     pdf, pin, page=int(form.get("page") or 1), x=int(form.get("x") or 50), y=int(form.get("y") or 50),
-                    w=int(form.get("w") or 220), h=int(form.get("h") or 60),
+                    width=int(form.get("w") or 220), height=int(form.get("h") or 60),
                     reason=form.get("reason"), location=form.get("location"), cert_label=form.get("cert_label") or None)
                 del pin, form
                 out = (os.path.splitext(fn or "documento")[0]) + "-firmado.pdf"
